@@ -24,6 +24,7 @@
     <TargetName>switch_ime</TargetName>
     <OutDir>$(ProjectDir)bin\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
+    <LinkIncremental Condition="'$(Configuration)'=='Release'">false</LinkIncremental>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -42,6 +43,8 @@
       <SubSystem>Windows</SubSystem>
       <AdditionalDependencies>User32.lib;Gdi32.lib;Shell32.lib;Imm32.lib;Advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <OptimizeReferences Condition="'$(Configuration)'=='Release'">true</OptimizeReferences>
+      <EnableCOMDATFolding Condition="'$(Configuration)'=='Release'">true</EnableCOMDATFolding>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="switch_ime.cpp" /></ItemGroup>
