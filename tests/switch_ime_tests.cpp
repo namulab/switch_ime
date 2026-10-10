@@ -3,6 +3,12 @@
 UINT testMenuCommand = 0;
 HWND testMenuOwner = nullptr;
 unsigned testMenuCalls = 0;
+unsigned testErrorMessages = 0;
+int WINAPI TestMessageBox(HWND, LPCWSTR, LPCWSTR, UINT)
+{
+    ++testErrorMessages;
+    return IDOK;
+}
 BOOL WINAPI TestTrackPopupMenu(HMENU, UINT, int, int, int, HWND owner, const RECT*)
 {
     testMenuOwner = owner;
@@ -10,8 +16,10 @@ BOOL WINAPI TestTrackPopupMenu(HMENU, UINT, int, int, int, HWND owner, const REC
     return static_cast<BOOL>(testMenuCommand);
 }
 #define TrackPopupMenu TestTrackPopupMenu
+#define MessageBoxW TestMessageBox
 #include "../switch_ime.cpp"
 #undef TrackPopupMenu
+#undef MessageBoxW
 #include <cstdlib>
 #include "../version.h"
 
@@ -148,6 +156,8 @@ LRESULT CALLBACK FakeIme(HWND window, UINT message, WPARAM command, LPARAM data)
 }
 
 bool saveDialog = false;
+int startupChoice = -1;
+bool expectSaveFailure = false;
 std::wstring screenshot;
 
 void Snapshot(HWND dialog)
@@ -225,6 +235,11 @@ INT_PTR CALLBACK TestDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         };
         capture(on, VK_KANA);
         auto* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+        if (state->startupKey)
+            Check((IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) == state->originalStartup.exists,
+                "startup checkbox reflects registry entry");
+        if (startupChoice >= 0)
+            CheckDlgButton(dialog, IDC_STARTUP, startupChoice ? BST_CHECKED : BST_UNCHECKED);
         Check(state->keys.on == VK_KANA, "native IME key registered before translation");
         captureApp.filter.down[0xF2] = true;
         capture(on, 0xF2);
@@ -241,7 +256,14 @@ INT_PTR CALLBACK TestDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         Check(lstrcmpW(name, after) == 0, "text typing does not overwrite registration");
         SendMessageW(on, WM_KEYDOWN, VK_PROCESSKEY, data);
         Check(state->keys.on == VK_F9, "IME-translated VK_PROCESSKEY cannot overwrite captured VK");
-        return SettingsProc(dialog, WM_COMMAND, saveDialog ? IDOK : IDCANCEL, 0);
+        const unsigned messages = testErrorMessages;
+        const INT_PTR result = SettingsProc(dialog, WM_COMMAND, saveDialog ? IDOK : IDCANCEL, 0);
+        if (expectSaveFailure)
+        {
+            Check(testErrorMessages == messages + 1, "failed INI save reports error without closing dialog");
+            return SettingsProc(dialog, WM_COMMAND, IDCANCEL, 0);
+        }
+        return result;
     }
     return SettingsProc(dialog, message, wParam, lParam);
 }
@@ -293,6 +315,56 @@ int wmain(int argc, wchar_t** argv)
         "settings cancel preserves existing INI");
     Check(!SaveKeys(ini, {VK_F9, VK_F9}) && LoadKeys(ini, loaded) && loaded.on == VK_F11,
         "invalid save preserves existing configuration");
+
+    // A volatile, isolated key: these tests never touch the real Run key.
+    const std::wstring testKey = L"Software\\namulab\\switch_ime.Tests." + std::to_wstring(GetCurrentProcessId());
+    HKEY startupKey = nullptr;
+    Check(RegCreateKeyExW(HKEY_CURRENT_USER, testKey.c_str(), 0, nullptr, REG_OPTION_VOLATILE,
+        KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &startupKey, nullptr) == ERROR_SUCCESS,
+        "isolated volatile registry key available");
+    const DWORD marker = 42;
+    Check(RegSetValueExW(startupKey, L"other_app", 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&marker), sizeof(marker)) == ERROR_SUCCESS, "unrelated entry seeded");
+    DialogState startup{loaded, &ini};
+    startup.startupKey = startupKey;
+    StartupEntry entry;
+    auto showStartup = [&]()
+    {
+        return DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_SETTINGS), nullptr,
+            TestDialog, reinterpret_cast<LPARAM>(&startup));
+    };
+    startupChoice = 1;
+    Check(showStartup() == IDCANCEL && ReadStartup(startupKey, entry) && !entry.exists,
+        "checking startup then cancelling leaves no registration");
+    saveDialog = true;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) && entry.exists && entry.type == REG_SZ,
+        "checking startup then OK registers executable");
+    std::wstring exe;
+    StartupEntry expected;
+    Check(GetExePath(exe) && MakeStartupEntry(exe, expected) && entry.data == expected.data,
+        "startup command quotes exact executable path");
+    Check(MakeStartupEntry(L"C:\\日本語 folder\\switch_ime.exe", entry), "Unicode and spaces accepted in startup path");
+    Check(!MakeStartupEntry(std::wstring(259, L'x'), entry), "overlong Run command rejected");
+    saveDialog = false;
+    startupChoice = 0;
+    Check(showStartup() == IDCANCEL && ReadStartup(startupKey, entry) && entry.data == expected.data,
+        "unchecking startup then cancelling preserves registration");
+    saveDialog = true;
+    const std::wstring badIni = folder + L"\\missing-folder\\settings.ini";
+    startup.ini = &badIni;
+    expectSaveFailure = true;
+    Check(showStartup() == IDCANCEL && ReadStartup(startupKey, entry) && entry.data == expected.data,
+        "failed INI save restores original startup entry");
+    expectSaveFailure = false;
+    startup.ini = &ini;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) && !entry.exists,
+        "unchecking startup then OK removes registration");
+    DWORD untouched = 0, size = sizeof(untouched);
+    Check(RegQueryValueExW(startupKey, L"other_app", nullptr, nullptr,
+        reinterpret_cast<BYTE*>(&untouched), &size) == ERROR_SUCCESS && untouched == marker,
+        "startup changes preserve other applications");
+    RegCloseKey(startupKey);
+    Check(RegDeleteKeyW(HKEY_CURRENT_USER, testKey.c_str()) == ERROR_SUCCESS, "isolated registry key cleaned up");
 
     WNDCLASSW cls{};
     cls.lpfnWndProc = FakeIme;

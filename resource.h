@@ -4,3 +4,4 @@
 #define IDC_OFF_KEY 1002
 #define IDC_ON_LABEL 1003
 #define IDC_OFF_LABEL 1004
+#define IDC_STARTUP 1005

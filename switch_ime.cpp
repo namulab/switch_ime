@@ -7,6 +7,7 @@
 #include <cwchar>
 #include <cstdio>
 #include <cerrno>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <deque>
@@ -110,7 +111,7 @@ void MakeInputs(bool turnOn, INPUT (&inputs)[2])
     inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
 }
 
-bool GetIniPath(std::wstring& path)
+bool GetExePath(std::wstring& path)
 {
     std::vector<wchar_t> buffer(260);
     for (;;)
@@ -120,15 +121,21 @@ bool GetIniPath(std::wstring& path)
         if (length < buffer.size())
         {
             path.assign(buffer.data(), length);
-            const auto slash = path.find_last_of(L"\\/");
-            if (slash == std::wstring::npos) return false;
-            path.resize(slash + 1);
-            path += L"switch_ime.ini";
             return true;
         }
         if (buffer.size() >= 32768) return false;
         buffer.resize(buffer.size() * 2);
     }
+}
+
+bool GetIniPath(std::wstring& path)
+{
+    if (!GetExePath(path)) return false;
+    const auto slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return false;
+    path.resize(slash + 1);
+    path += L"switch_ime.ini";
+    return true;
 }
 
 bool ParseVk(const wchar_t* text, UINT& result)
@@ -190,12 +197,57 @@ std::wstring KeyName(UINT vk, LPARAM keyData = 0)
     return name;
 }
 
+// Only our named value is changed. The current-user Run key needs no elevation.
+struct StartupEntry
+{
+    bool exists = false;
+    DWORD type = REG_SZ;
+    std::vector<BYTE> data;
+};
+
+bool ReadStartup(HKEY key, StartupEntry& entry)
+{
+    entry = {};
+    DWORD size = 0;
+    LSTATUS status = RegQueryValueExW(key, L"switch_ime", nullptr, &entry.type, nullptr, &size);
+    if (status == ERROR_FILE_NOT_FOUND) return true;
+    if (status != ERROR_SUCCESS) return false;
+    entry.data.resize(size);
+    status = RegQueryValueExW(key, L"switch_ime", nullptr, &entry.type, entry.data.data(), &size);
+    if (status != ERROR_SUCCESS) return false;
+    entry.data.resize(size);
+    entry.exists = true;
+    return true;
+}
+
+bool WriteStartup(HKEY key, const StartupEntry& entry)
+{
+    const LSTATUS status = entry.exists ? RegSetValueExW(key, L"switch_ime", 0,
+        entry.type, entry.data.data(), static_cast<DWORD>(entry.data.size())) :
+        RegDeleteValueW(key, L"switch_ime");
+    return status == ERROR_SUCCESS || (!entry.exists && status == ERROR_FILE_NOT_FOUND);
+}
+
+bool MakeStartupEntry(const std::wstring& exe, StartupEntry& entry)
+{
+    const std::wstring command = L"\"" + exe + L"\"";
+    // Run command lines have a documented 260-character limit.
+    if (exe.empty() || command.size() > 260) return false;
+    entry = {};
+    entry.exists = true;
+    entry.data.resize((command.size() + 1) * sizeof(wchar_t));
+    std::memcpy(entry.data.data(), command.c_str(), entry.data.size());
+    return true;
+}
+
 struct DialogState
 {
     Keys keys;
     const std::wstring* ini;
     HFONT font = nullptr;
     const POINT* anchor = nullptr;
+    HKEY startupKey = nullptr;
+    StartupEntry originalStartup;
 };
 WNDPROC gEditProc = nullptr;
 HWND gCaptureEdits[2]{};
@@ -246,11 +298,12 @@ void LayoutSettings(HWND dialog, HFONT uiFont)
     const Control controls[] = {
         {IDC_ON_LABEL, {7, 9, 67, 17}}, {IDC_ON_KEY, {71, 7, 170, 18}},
         {IDC_OFF_LABEL, {7, 22, 67, 30}}, {IDC_OFF_KEY, {71, 20, 170, 31}},
-        {IDOK, {43, 37, 103, 51}}, {IDCANCEL, {110, 37, 170, 51}}
+        {IDC_STARTUP, {7, 37, 170, 47}},
+        {IDOK, {43, 53, 103, 67}}, {IDCANCEL, {110, 53, 170, 67}}
     };
     RECT previous{};
     GetWindowRect(dialog, &previous);
-    RECT size{0, 0, 177, 56};
+    RECT size{0, 0, 177, 72};
     map(size);
     AdjustWindowRectEx(&size, static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_STYLE)),
         FALSE, static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_EXSTYLE)));
@@ -304,6 +357,14 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
             state->font = CreateFontIndirectW(&metrics.lfMessageFont);
         if (state->font) SendMessageW(dialog, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), FALSE);
         LayoutSettings(dialog, state->font);
+        if (state->startupKey && !ReadStartup(state->startupKey, state->originalStartup))
+        {
+            MessageBoxW(dialog, L"自動起動の登録状態を取得できません。", L"switch_ime", MB_OK | MB_ICONERROR);
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        CheckDlgButton(dialog, IDC_STARTUP, state->originalStartup.exists ? BST_CHECKED : BST_UNCHECKED);
+        EnableWindow(GetDlgItem(dialog, IDC_STARTUP), state->startupKey != nullptr);
         for (const int id : {IDC_ON_KEY, IDC_OFF_KEY})
         {
             const HWND edit = GetDlgItem(dialog, id);
@@ -326,8 +387,27 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
                 MessageBoxW(dialog, L"ONとOFFに異なるキーを登録してください。", L"switch_ime", MB_OK | MB_ICONWARNING);
                 return TRUE;
             }
+            StartupEntry desired;
+            if (state->startupKey && IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED)
+            {
+                std::wstring exe;
+                if (!GetExePath(exe) || !MakeStartupEntry(exe, desired))
+                {
+                    MessageBoxW(dialog, L"自動起動に登録できません。EXEのパスが長すぎないか確認してください。",
+                        L"switch_ime", MB_OK | MB_ICONERROR);
+                    return TRUE;
+                }
+            }
+            if (state->startupKey && !WriteStartup(state->startupKey, desired))
+            {
+                MessageBoxW(dialog, L"自動起動の登録を変更できません。", L"switch_ime", MB_OK | MB_ICONERROR);
+                return TRUE;
+            }
             if (!SaveKeys(*state->ini, state->keys))
             {
+                if (state->startupKey && !WriteStartup(state->startupKey, state->originalStartup))
+                    MessageBoxW(dialog, L"自動起動の登録状態を元に戻せません。設定を再確認してください。",
+                        L"switch_ime", MB_OK | MB_ICONERROR);
                 MessageBoxW(dialog, L"設定を保存できません。EXEのフォルダへの書き込み権限を確認してください。",
                     L"switch_ime", MB_OK | MB_ICONERROR);
                 return TRUE;
@@ -467,11 +547,20 @@ struct App
 
     bool Settings(const POINT* anchor = nullptr)
     {
+        HKEY startupKey = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &startupKey, nullptr) != ERROR_SUCCESS)
+        {
+            MessageBoxW(window, L"自動起動の設定を開けません。", L"switch_ime", MB_OK | MB_ICONERROR);
+            return false;
+        }
         paused = true;
         ++generation;
         DialogState dialog{keys, &ini, nullptr, anchor};
+        dialog.startupKey = startupKey;
         const INT_PTR result = DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_SETTINGS),
             window, SettingsProc, reinterpret_cast<LPARAM>(&dialog));
+        RegCloseKey(startupKey);
         if (result == IDOK) keys = dialog.keys;
         ++generation;
         paused = false;
