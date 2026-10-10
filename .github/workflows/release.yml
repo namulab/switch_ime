@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set version from tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node ci/release.mjs prepare
+      - name: Build and test
+        run: node ci/release.mjs build
+      - name: Package executable and license
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node ci/release.mjs package
+      - name: Publish GitHub Release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node ci/release.mjs publish

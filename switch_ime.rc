@@ -1,0 +1,50 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "resource.h"
+#include "version.h"
+
+1 VERSIONINFO
+FILEVERSION SWITCH_IME_VERSION_NUMBER
+PRODUCTVERSION SWITCH_IME_VERSION_NUMBER
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS VS_FF_DEBUG
+#else
+FILEFLAGS 0
+#endif
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "switch_ime"
+            VALUE "FileVersion", SWITCH_IME_VERSION_STRING
+            VALUE "InternalName", "switch_ime"
+            VALUE "LegalCopyright", "Copyright (c) 2026 namulab"
+            VALUE "OriginalFilename", "switch_ime.exe"
+            VALUE "ProductName", "switch_ime"
+            VALUE "ProductVersion", SWITCH_IME_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+IDD_SETTINGS DIALOGEX 0, 0, 177, 56
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_TOPMOST
+CAPTION "switch_ime 設定"
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT "IMEをONにするキー", IDC_ON_LABEL, 7, 9, 60, 8
+    EDITTEXT IDC_ON_KEY, 71, 7, 99, 11, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "IMEをOFFにするキー", IDC_OFF_LABEL, 7, 22, 60, 8
+    EDITTEXT IDC_OFF_KEY, 71, 20, 99, 11, ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "OK", IDOK, 43, 37, 60, 14
+    PUSHBUTTON "キャンセル", IDCANCEL, 110, 37, 60, 14
+END
