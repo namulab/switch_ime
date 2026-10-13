@@ -20,7 +20,6 @@ constexpr wchar_t kClass[] = L"switch_ime.Window";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kSwitchMessage = WM_APP + 2; // Notification to our own HWND only.
 constexpr UINT kCaptureKey = WM_APP + 3;
-constexpr UINT_PTR kTimer = 1;
 constexpr UINT kSettingsCommand = 1;
 constexpr UINT kExitCommand = 2;
 constexpr WPARAM kGetOpen = 0x0005; // Legacy IMC_GETOPENSTATUS
@@ -431,57 +430,6 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
     return FALSE;
 }
 
-HICON MakeIcon(const wchar_t* text)
-{
-    constexpr int size = 32;
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = size;
-    info.bmiHeader.biHeight = -size;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    void* pixels = nullptr;
-    HDC colorDC = CreateCompatibleDC(nullptr), maskDC = CreateCompatibleDC(nullptr);
-    HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
-    HFONT font = CreateFontW(-28, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
-    HICON icon = nullptr;
-    if (colorDC && maskDC && color && mask && font && pixels)
-    {
-        const auto oldColor = SelectObject(colorDC, color), oldMask = SelectObject(maskDC, mask);
-        const auto oldFont = SelectObject(colorDC, font);
-        const bool blank = !*text;
-        PatBlt(maskDC, 0, 0, size, size, blank ? WHITENESS : BLACKNESS);
-        auto* data = static_cast<DWORD*>(pixels);
-        for (int i = 0; i < size * size; ++i) data[i] = blank ? 0 : 0x00202020;
-        if (!blank)
-        {
-            SetBkMode(colorDC, TRANSPARENT);
-            SetTextColor(colorDC, RGB(255, 255, 255));
-            RECT rect{0, 0, size, size};
-            DrawTextW(colorDC, text, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            GdiFlush();
-            for (int i = 0; i < size * size; ++i) data[i] |= 0xFF000000;
-        }
-        SelectObject(colorDC, oldFont);
-        SelectObject(colorDC, oldColor);
-        SelectObject(maskDC, oldMask);
-        ICONINFO iconInfo{};
-        iconInfo.fIcon = TRUE;
-        iconInfo.hbmColor = color;
-        iconInfo.hbmMask = mask;
-        icon = CreateIconIndirect(&iconInfo);
-    }
-    if (font) DeleteObject(font);
-    if (color) DeleteObject(color);
-    if (mask) DeleteObject(mask);
-    if (colorDC) DeleteDC(colorDC);
-    if (maskDC) DeleteDC(maskDC);
-    return icon;
-}
-
 struct KeyFilter
 {
     // VK can change between make and break for Japanese mode keys.
@@ -528,9 +476,8 @@ struct App
     Keys keys;
     KeyFilter filter;
     std::wstring ini;
-    HICON icons[3]{};
+    HICON icon = nullptr;
     NOTIFYICONDATAW tray{};
-    ImeState displayed = ImeState::Unknown;
     bool trayAdded = false;
     bool paused = false;
     unsigned generation = 0;
@@ -542,7 +489,7 @@ struct App
         if (hook) UnhookWindowsHookEx(hook);
         gApp = nullptr;
         if (trayAdded) Shell_NotifyIconW(NIM_DELETE, &tray);
-        for (const HICON icon : icons) if (icon) DestroyIcon(icon);
+        if (icon) DestroyIcon(icon);
     }
 
     bool Settings(const POINT* anchor = nullptr)
@@ -567,15 +514,6 @@ struct App
         return result == IDOK;
     }
 
-    void Poll()
-    {
-        Target target{};
-        const ImeState state = CaptureTarget(target) ? ReadIme(target) : ImeState::Unknown;
-        if (state == displayed) return;
-        tray.hIcon = icons[static_cast<int>(state)];
-        if (Shell_NotifyIconW(NIM_MODIFY, &tray)) displayed = state;
-    }
-
     void Enqueue(bool turnOn)
     {
         Target target{};
@@ -592,7 +530,7 @@ struct App
         if (paused || request.generation != generation) return;
         Target current{};
         if (!CaptureTarget(current) || !(current == request.target)) return;
-        const ImeState state = ReadIme(current); // Never use the cached tray state.
+        const ImeState state = ReadIme(current); // Read only for a registered physical key press.
         Target finalTarget{};
         if (!NeedsSwitch(request.turnOn, state) || !CaptureTarget(finalTarget) ||
             !(finalTarget == current)) return;
@@ -673,7 +611,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     if (app)
     {
-        if (message == WM_TIMER && wParam == kTimer) { app->Poll(); return 0; }
         if (message == kSwitchMessage) { app->Switch(); return 0; }
         if (message == kTrayMessage)
         {
@@ -688,7 +625,6 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     if (message == WM_DESTROY)
     {
-        KillTimer(window, kTimer);
         PostQuitMessage(0);
         return 0;
     }
@@ -746,16 +682,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         Error(L"INIのキー設定が無効です。異なる2つのキーを登録してください。");
         if (!app.Settings()) { DestroyWindow(app.window); return 0; }
     }
-    app.icons[0] = MakeIcon(L"");
-    app.icons[1] = MakeIcon(L"A");
-    app.icons[2] = MakeIcon(L"あ");
+    app.icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_TRAY), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
     app.tray.cbSize = sizeof(app.tray);
     app.tray.hWnd = app.window;
     app.tray.uID = 1;
     app.tray.uFlags = NIF_ICON | NIF_MESSAGE;
     app.tray.uCallbackMessage = kTrayMessage;
-    app.tray.hIcon = app.icons[0];
-    if (!app.icons[0] || !app.icons[1] || !app.icons[2])
+    app.tray.hIcon = app.icon;
+    if (!app.icon)
     {
         Error(L"トレイアイコンを作成できません。");
         DestroyWindow(app.window);
@@ -768,13 +703,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         DestroyWindow(app.window);
         return 1;
     }
-    if (!SetTimer(app.window, kTimer, 100, nullptr))
-    {
-        Error(L"タイマーを開始できません。");
-        DestroyWindow(app.window);
-        return 1;
-    }
-    app.Poll();
     MSG message{};
     BOOL status = 0;
     while ((status = GetMessageW(&message, nullptr, 0, 0)) > 0)

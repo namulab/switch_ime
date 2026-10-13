@@ -52,6 +52,8 @@
   <ItemGroup><ClInclude Include="version.h" /></ItemGroup>
   <ItemGroup><ResourceCompile Include="switch_ime.rc" /></ItemGroup>
   <ItemGroup>
+    <None Include="switch_ime.ico" />
+    <None Include="switch_ime.svg" />
     <None Include="README.md" />
     <None Include="LICENSE" />
     <None Include="docs\ime-verification.md" />

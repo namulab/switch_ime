@@ -1,5 +1,12 @@
 // Separate executable; these checks are not compiled into switch_ime.exe.
 #include <windows.h>
+#include <imm.h>
+unsigned testImeQueries = 0;
+HWND WINAPI TestImmGetDefaultIMEWnd(HWND)
+{
+    ++testImeQueries;
+    return nullptr;
+}
 UINT testMenuCommand = 0;
 HWND testMenuOwner = nullptr;
 unsigned testMenuCalls = 0;
@@ -17,9 +24,11 @@ BOOL WINAPI TestTrackPopupMenu(HMENU, UINT, int, int, int, HWND owner, const REC
 }
 #define TrackPopupMenu TestTrackPopupMenu
 #define MessageBoxW TestMessageBox
+#define ImmGetDefaultIMEWnd TestImmGetDefaultIMEWnd
 #include "../switch_ime.cpp"
 #undef TrackPopupMenu
 #undef MessageBoxW
+#undef ImmGetDefaultIMEWnd
 #include <cstdlib>
 #include "../version.h"
 
@@ -62,6 +71,33 @@ void CheckExecutableVersion()
         Check(VerQueryValueW(data.data(), field, reinterpret_cast<void**>(&value), &length) &&
             value && expected == value, "EXE string version matches build version");
     }
+}
+
+void CheckFixedTray()
+{
+    for (const int size : {16, 24, 32, 48})
+    {
+        const auto icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),
+            MAKEINTRESOURCEW(IDI_TRAY), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+        Check(icon != nullptr, "embedded fixed tray icon loads at requested size");
+        DestroyIcon(icon);
+    }
+    WNDCLASSW cls{};
+    cls.lpfnWndProc = WindowProc;
+    cls.hInstance = GetModuleHandleW(nullptr);
+    cls.lpszClassName = L"switch_ime.TestIdle";
+    Check(RegisterClassW(&cls) != 0, "idle test window class registered");
+    App app;
+    app.window = CreateWindowExW(0, cls.lpszClassName, L"", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, cls.hInstance, &app);
+    Check(app.window != nullptr, "idle test window created");
+    testImeQueries = 0;
+    for (int i = 0; i < 10; ++i) SendMessageW(app.window, WM_TIMER, 1, 0);
+    Check(testImeQueries == 0, "timer messages do not query IME state");
+    Check(ReadIme({}) == ImeState::Unknown && testImeQueries == 1,
+        "explicit IME request still queries state and preserves acquisition failure");
+    DestroyWindow(app.window);
+    UnregisterClassW(cls.lpszClassName, cls.hInstance);
 }
 
 void CheckFilter()
@@ -377,6 +413,7 @@ int wmain(int argc, wchar_t** argv)
     Check(QueryIme(fake, kGetOpen, response) && response == 0, "delivered zero differs from send failure");
     DestroyWindow(fake);
     Check(!QueryIme(fake, kGetOpen, response), "destroyed IME window is acquisition failure");
+    CheckFixedTray();
     DeleteFileW(ini.c_str());
     std::puts("All tests passed. No real IME switching or global hook installed by tests.");
 }

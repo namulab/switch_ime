@@ -3,6 +3,8 @@
 #include "resource.h"
 #include "version.h"
 
+IDI_TRAY ICON "switch_ime.ico"
+
 1 VERSIONINFO
 FILEVERSION SWITCH_IME_VERSION_NUMBER
 PRODUCTVERSION SWITCH_IME_VERSION_NUMBER

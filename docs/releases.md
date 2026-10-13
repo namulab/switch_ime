@@ -1,16 +1,16 @@
 # Releases / リリース
 
-The current local build version is **0.1.1** in `version.h`. Windows numeric file/product versions use four fields (`0.1.1.0`); the displayed version strings use three (`0.1.1`).
+The current local build version is **0.1.2** in `version.h`. Windows numeric file/product versions use four fields (`0.1.2.0`); the displayed version strings use three (`0.1.2`).
 
-現在のローカルビルドの版番号は `version.h` の **0.1.1** です。Windowsの数値形式は4桁（`0.1.1.0`）、表示文字列は3桁（`0.1.1`）です。
+現在のローカルビルドの版番号は `version.h` の **0.1.2** です。Windowsの数値形式は4桁（`0.1.2.0`）、表示文字列は3桁（`0.1.2`）です。
 
 After pushing this repository to GitHub, commit the workflow and create/push a tag:
 
 GitHubへリポジトリを登録し、ワークフローを含むコミットに以下のようなタグを作成・送信してください。
 
 ```text
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 Creating the same tag through GitHub's interface also triggers the workflow. Tags must be `vMAJOR.MINOR.PATCH` with no leading zeroes except zero itself. Each component must fit Windows' 16-bit version fields (0–65535). Prerelease suffixes are not accepted by this workflow.
