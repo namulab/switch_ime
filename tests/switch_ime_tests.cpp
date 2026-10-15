@@ -1,6 +1,31 @@
 // Separate executable; these checks are not compiled into switch_ime.exe.
 #include <windows.h>
 #include <imm.h>
+#include <shellapi.h>
+int testElevation = -1; // -1: real query; -2: fail; 0/1: simulated token.
+unsigned testElevationLaunches = 0;
+DWORD testElevationLaunchError = ERROR_SUCCESS;
+bool testElevationCommand = false;
+BOOL WINAPI TestGetTokenInformation(HANDLE token, TOKEN_INFORMATION_CLASS kind,
+    LPVOID info, DWORD size, PDWORD returned)
+{
+    if (testElevation == -1 || kind != TokenElevation)
+        return GetTokenInformation(token, kind, info, size, returned);
+    if (testElevation == -2) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+    if (size < sizeof(TOKEN_ELEVATION)) return FALSE;
+    static_cast<TOKEN_ELEVATION*>(info)->TokenIsElevated = static_cast<DWORD>(testElevation);
+    *returned = sizeof(TOKEN_ELEVATION);
+    return TRUE;
+}
+BOOL WINAPI TestShellExecuteEx(SHELLEXECUTEINFOW* execute)
+{
+    ++testElevationLaunches;
+    testElevationCommand = lstrcmpW(execute->lpVerb, L"runas") == 0 &&
+        execute->lpFile && *execute->lpFile && lstrcmpW(execute->lpParameters, L"--elevated") == 0 &&
+        (execute->fMask & SEE_MASK_NOASYNC) && execute->nShow == SW_HIDE;
+    SetLastError(testElevationLaunchError);
+    return testElevationLaunchError == ERROR_SUCCESS;
+}
 unsigned testImeQueries = 0;
 HWND WINAPI TestImmGetDefaultIMEWnd(HWND)
 {
@@ -25,10 +50,14 @@ BOOL WINAPI TestTrackPopupMenu(HMENU, UINT, int, int, int, HWND owner, const REC
 #define TrackPopupMenu TestTrackPopupMenu
 #define MessageBoxW TestMessageBox
 #define ImmGetDefaultIMEWnd TestImmGetDefaultIMEWnd
+#define GetTokenInformation TestGetTokenInformation
+#define ShellExecuteExW TestShellExecuteEx
 #include "../switch_ime.cpp"
 #undef TrackPopupMenu
 #undef MessageBoxW
 #undef ImmGetDefaultIMEWnd
+#undef GetTokenInformation
+#undef ShellExecuteExW
 #include <cstdlib>
 #include "../version.h"
 
@@ -38,6 +67,29 @@ void Check(bool condition, const char* description)
 {
     if (!condition) { std::fprintf(stderr, "FAIL: %s\n", description); std::exit(1); }
     std::printf("PASS: %s\n", description);
+}
+
+void CheckElevation()
+{
+    testElevation = 1;
+    Check(EnsureElevated(false) == ElevationResult::Continue && testElevationLaunches == 0,
+        "elevated process starts without another launch");
+    testElevation = 0;
+    Check(EnsureElevated(false) == ElevationResult::Restarted && testElevationLaunches == 1 &&
+        testElevationCommand, "unelevated startup requests runas of own executable then exits");
+    testElevationLaunchError = ERROR_CANCELLED;
+    const unsigned messages = testErrorMessages;
+    Check(EnsureElevated(false) == ElevationResult::Continue && testErrorMessages == messages + 1,
+        "UAC cancellation explains normal-privilege operation and continues");
+    testElevationLaunchError = ERROR_ACCESS_DENIED;
+    Check(EnsureElevated(false) == ElevationResult::Failed, "failed elevation does not start resident app");
+    const unsigned launches = testElevationLaunches;
+    Check(EnsureElevated(true) == ElevationResult::Failed && testElevationLaunches == launches,
+        "relaunch marker cannot bypass token verification or cause a restart loop");
+    testElevation = -2;
+    Check(EnsureElevated(false) == ElevationResult::Failed && testElevationLaunches == launches,
+        "token query failure cannot be treated as elevated");
+    testElevation = -1;
 }
 
 void CheckExecutableVersion()
@@ -96,6 +148,19 @@ void CheckFixedTray()
     Check(testImeQueries == 0, "timer messages do not query IME state");
     Check(ReadIme({}) == ImeState::Unknown && testImeQueries == 1,
         "explicit IME request still queries state and preserves acquisition failure");
+    app.keys.runAsAdmin = true;
+    testElevation = 0;
+    testElevationLaunchError = ERROR_CANCELLED;
+    const unsigned launches = testElevationLaunches;
+    SendMessageW(app.window, kElevationMessage, 0, 0);
+    Check(IsWindow(app.window) && app.keys.runAsAdmin && testElevationLaunches == launches + 1,
+        "cancelled settings elevation preserves resident window and configured option");
+    app.keys.runAsAdmin = false;
+    SendMessageW(app.window, kElevationMessage, 0, 0);
+    Check(IsWindow(app.window) && testElevationLaunches == launches + 1,
+        "turning administrator option off prevents another elevation request");
+    testElevation = -1;
+    testElevationLaunchError = ERROR_SUCCESS;
     DestroyWindow(app.window);
     UnregisterClassW(cls.lpszClassName, cls.hInstance);
 }
@@ -193,6 +258,7 @@ LRESULT CALLBACK FakeIme(HWND window, UINT message, WPARAM command, LPARAM data)
 
 bool saveDialog = false;
 int startupChoice = -1;
+int adminChoice = -1;
 bool expectSaveFailure = false;
 std::wstring screenshot;
 
@@ -271,6 +337,23 @@ INT_PTR CALLBACK TestDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         };
         capture(on, VK_KANA);
         auto* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+        Check(state->tooltip && SendMessageW(state->tooltip, TTM_GETTOOLCOUNT, 0, 0) == 2,
+            "both checkbox tooltips are attached");
+        for (const int id : {IDC_ADMIN, IDC_STARTUP})
+        {
+            wchar_t helpText[256]{};
+            TOOLINFOW help{};
+            help.cbSize = TTTOOLINFOW_V2_SIZE;
+            help.hwnd = dialog;
+            help.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(dialog, id));
+            help.lpszText = helpText;
+            SendMessageW(state->tooltip, TTM_GETTEXTW, 256, reinterpret_cast<LPARAM>(&help));
+            Check(lstrcmpW(helpText, id == IDC_ADMIN ? kAdminHelp : kStartupHelp) == 0,
+                "checkbox tooltip contains its explanation");
+        }
+        Check((IsDlgButtonChecked(dialog, IDC_ADMIN) == BST_CHECKED) == state->keys.runAsAdmin,
+            "administrator checkbox reflects saved setting");
+        if (adminChoice >= 0) CheckDlgButton(dialog, IDC_ADMIN, adminChoice ? BST_CHECKED : BST_UNCHECKED);
         if (state->startupKey)
             Check((IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) == state->originalStartup.exists,
                 "startup checkbox reflects registry entry");
@@ -321,6 +404,7 @@ int wmain(int argc, wchar_t** argv)
     const std::wstring ini = folder + L"\\設定.ini";
     screenshot = folder + L"\\settings.bmp";
     DeleteFileW(ini.c_str());
+    CheckElevation();
     CheckExecutableVersion();
     CheckFilter();
     UINT vk = 0;
@@ -351,6 +435,25 @@ int wmain(int argc, wchar_t** argv)
         "settings cancel preserves existing INI");
     Check(!SaveKeys(ini, {VK_F9, VK_F9}) && LoadKeys(ini, loaded) && loaded.on == VK_F11,
         "invalid save preserves existing configuration");
+    Check(!loaded.runAsAdmin, "administrator option defaults to off");
+    DialogState admin{loaded, &ini};
+    adminChoice = 1;
+    saveDialog = true;
+    Check(DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_SETTINGS), nullptr,
+        TestDialog, reinterpret_cast<LPARAM>(&admin)) == IDOK && LoadKeys(ini, loaded) && loaded.runAsAdmin,
+        "administrator checkbox OK saves enabled option");
+    adminChoice = 0;
+    saveDialog = false;
+    Check(DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_SETTINGS), nullptr,
+        TestDialog, reinterpret_cast<LPARAM>(&admin)) == IDCANCEL && LoadKeys(ini, loaded) && loaded.runAsAdmin,
+        "administrator checkbox cancel preserves enabled option");
+    admin.keys = loaded;
+    saveDialog = true;
+    Check(DialogBoxParamW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_SETTINGS), nullptr,
+        TestDialog, reinterpret_cast<LPARAM>(&admin)) == IDOK && LoadKeys(ini, loaded) && !loaded.runAsAdmin,
+        "administrator checkbox OK saves disabled option");
+    adminChoice = -1;
+    saveDialog = false;
 
     // A volatile, isolated key: these tests never touch the real Run key.
     const std::wstring testKey = L"Software\\namulab\\switch_ime.Tests." + std::to_wstring(GetCurrentProcessId());

@@ -4,6 +4,8 @@
 #include <windowsx.h>
 #include <imm.h>
 #include <shellapi.h>
+#include <objbase.h>
+#include <commctrl.h>
 #include <cwchar>
 #include <cstdio>
 #include <cerrno>
@@ -20,6 +22,10 @@ constexpr wchar_t kClass[] = L"switch_ime.Window";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kSwitchMessage = WM_APP + 2; // Notification to our own HWND only.
 constexpr UINT kCaptureKey = WM_APP + 3;
+constexpr UINT kElevationMessage = WM_APP + 4;
+constexpr wchar_t kAdminHelp[] = L"管理者権限で起動されたアプリ上でもIME切り替えを有効にしたい場合は、このオプションをONにします。";
+constexpr wchar_t kStartupHelp[] = L"現在サインインしているユーザーにのみ適用されます。";
+void Error(const wchar_t* message);
 constexpr UINT kSettingsCommand = 1;
 constexpr UINT kExitCommand = 2;
 constexpr WPARAM kGetOpen = 0x0005; // Legacy IMC_GETOPENSTATUS
@@ -30,6 +36,7 @@ struct Keys
 {
     UINT on = 0;
     UINT off = 0;
+    bool runAsAdmin = false;
     bool Valid() const { return on >= 8 && on <= 254 && off >= 8 && off <= 254 && on != off; }
 };
 
@@ -137,6 +144,54 @@ bool GetIniPath(std::wstring& path)
     return true;
 }
 
+bool GetElevation(bool& elevated)
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION info{};
+    DWORD size = 0;
+    const bool success = GetTokenInformation(token, TokenElevation, &info, sizeof(info), &size) != FALSE;
+    CloseHandle(token);
+    if (success) elevated = info.TokenIsElevated != 0;
+    return success;
+}
+
+enum class ElevationResult { Continue, Restarted, Failed };
+
+ElevationResult EnsureElevated(bool relaunched)
+{
+    bool elevated = false;
+    if (!GetElevation(elevated)) return ElevationResult::Failed;
+    if (elevated) return ElevationResult::Continue;
+    // Verify the token again in the child; the argument never grants permission.
+    if (relaunched) return ElevationResult::Failed;
+    std::wstring exe;
+    if (!GetExePath(exe)) return ElevationResult::Failed;
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    if (FAILED(initialized)) return ElevationResult::Failed;
+    SHELLEXECUTEINFOW execute{};
+    execute.cbSize = sizeof(execute);
+    execute.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    execute.lpVerb = L"runas";
+    execute.lpFile = exe.c_str();
+    execute.lpParameters = L"--elevated";
+    execute.nShow = SW_HIDE;
+    const bool started = ShellExecuteExW(&execute) != FALSE;
+    const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+    CoUninitialize();
+    if (started) return ElevationResult::Restarted;
+    // Keep the current process usable so the user can turn this option off.
+    if (error == ERROR_CANCELLED)
+    {
+        MessageBoxW(nullptr, L"管理者権限での起動がキャンセルされたため\n"
+            L"通常のユーザー権限で動作を続けます。\n\n"
+            L"管理者権限で実行中のアプリではIMEを切り替えられません。",
+            L"switch_ime", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return ElevationResult::Continue;
+    }
+    return ElevationResult::Failed;
+}
+
 bool ParseVk(const wchar_t* text, UINT& result)
 {
     errno = 0;
@@ -155,6 +210,7 @@ bool LoadKeys(const std::wstring& path, Keys& keys)
     GetPrivateProfileStringW(L"Keys", L"IME_OFF", L"", off, 64, path.c_str());
     Keys loaded;
     if (!ParseVk(on, loaded.on) || !ParseVk(off, loaded.off) || !loaded.Valid()) return false;
+    loaded.runAsAdmin = GetPrivateProfileIntW(L"Options", L"RunAsAdmin", 0, path.c_str()) != 0;
     keys = loaded;
     return true;
 }
@@ -162,8 +218,9 @@ bool LoadKeys(const std::wstring& path, Keys& keys)
 bool SaveKeys(const std::wstring& path, const Keys& keys)
 {
     if (!keys.Valid()) return false;
-    char contents[80]{};
-    const int length = sprintf_s(contents, "[Keys]\r\nIME_ON=0x%02X\r\nIME_OFF=0x%02X\r\n", keys.on, keys.off);
+    char contents[128]{};
+    const int length = sprintf_s(contents, "[Keys]\r\nIME_ON=0x%02X\r\nIME_OFF=0x%02X\r\n\r\n[Options]\r\nRunAsAdmin=%d\r\n",
+        keys.on, keys.off, keys.runAsAdmin ? 1 : 0);
     if (length <= 0) return false;
     // Replace both values together, so a write error does not leave half a configuration.
     const std::wstring temporary = path + L".tmp." + std::to_wstring(GetCurrentProcessId());
@@ -247,6 +304,7 @@ struct DialogState
     const POINT* anchor = nullptr;
     HKEY startupKey = nullptr;
     StartupEntry originalStartup;
+    HWND tooltip = nullptr;
 };
 WNDPROC gEditProc = nullptr;
 HWND gCaptureEdits[2]{};
@@ -298,11 +356,12 @@ void LayoutSettings(HWND dialog, HFONT uiFont)
         {IDC_ON_LABEL, {7, 9, 67, 17}}, {IDC_ON_KEY, {71, 7, 170, 18}},
         {IDC_OFF_LABEL, {7, 22, 67, 30}}, {IDC_OFF_KEY, {71, 20, 170, 31}},
         {IDC_STARTUP, {7, 37, 170, 47}},
-        {IDOK, {43, 53, 103, 67}}, {IDCANCEL, {110, 53, 170, 67}}
+        {IDC_ADMIN, {7, 50, 170, 60}},
+        {IDOK, {43, 66, 103, 80}}, {IDCANCEL, {110, 66, 170, 80}}
     };
     RECT previous{};
     GetWindowRect(dialog, &previous);
-    RECT size{0, 0, 177, 72};
+    RECT size{0, 0, 177, 85};
     map(size);
     AdjustWindowRectEx(&size, static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_STYLE)),
         FALSE, static_cast<DWORD>(GetWindowLongPtrW(dialog, GWL_EXSTYLE)));
@@ -318,6 +377,37 @@ void LayoutSettings(HWND dialog, HFONT uiFont)
         SetWindowPos(child, nullptr, rect.left, rect.top, rect.right - rect.left,
             rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
     }
+    auto* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+    if (state && state->tooltip) SendMessageW(state->tooltip, WM_SETFONT, font, FALSE);
+}
+
+bool CreateSettingsTooltips(HWND dialog, DialogState& state)
+{
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES};
+    if (!InitCommonControlsEx(&controls)) return false;
+    state.tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, CW_USEDEFAULT, dialog, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!state.tooltip) return false;
+    SendMessageW(state.tooltip, WM_SETFONT,
+        SendMessageW(GetDlgItem(dialog, IDC_ADMIN), WM_GETFONT, 0, 0), FALSE);
+    RECT width{0, 0, 190, 0};
+    MapDialogRect(dialog, &width);
+    SendMessageW(state.tooltip, TTM_SETMAXTIPWIDTH, 0, width.right);
+    SendMessageW(state.tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 100);
+    SendMessageW(state.tooltip, TTM_SETDELAYTIME, TTDT_RESHOW, 100);
+    struct Help { int id; const wchar_t* text; };
+    for (const auto& help : {Help{IDC_ADMIN, kAdminHelp}, Help{IDC_STARTUP, kStartupHelp}})
+    {
+        TOOLINFOW tool{};
+        tool.cbSize = TTTOOLINFOW_V2_SIZE;
+        tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tool.hwnd = dialog;
+        tool.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(dialog, help.id));
+        tool.lpszText = const_cast<wchar_t*>(help.text);
+        if (!SendMessageW(state.tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool))) return false;
+    }
+    return true;
 }
 
 LRESULT CALLBACK KeyEditProc(HWND edit, UINT message, WPARAM wParam, LPARAM lParam)
@@ -356,6 +446,8 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
             state->font = CreateFontIndirectW(&metrics.lfMessageFont);
         if (state->font) SendMessageW(dialog, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), FALSE);
         LayoutSettings(dialog, state->font);
+        CheckDlgButton(dialog, IDC_ADMIN, state->keys.runAsAdmin ? BST_CHECKED : BST_UNCHECKED);
+        CreateSettingsTooltips(dialog, *state);
         if (state->startupKey && !ReadStartup(state->startupKey, state->originalStartup))
         {
             MessageBoxW(dialog, L"自動起動の登録状態を取得できません。", L"switch_ime", MB_OK | MB_ICONERROR);
@@ -381,6 +473,7 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
     {
         if (LOWORD(wParam) == IDOK)
         {
+            state->keys.runAsAdmin = IsDlgButtonChecked(dialog, IDC_ADMIN) == BST_CHECKED;
             if (!state->keys.Valid())
             {
                 MessageBoxW(dialog, L"ONとOFFに異なるキーを登録してください。", L"switch_ime", MB_OK | MB_ICONWARNING);
@@ -419,6 +512,7 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
     if (message == WM_CLOSE) { EndDialog(dialog, IDCANCEL); return TRUE; }
     if (message == WM_DESTROY)
     {
+        if (state && state->tooltip) { DestroyWindow(state->tooltip); state->tooltip = nullptr; }
         gCaptureEdits[0] = gCaptureEdits[1] = nullptr;
         if (gSettingsDialog == dialog) gSettingsDialog = nullptr;
     }
@@ -508,7 +602,11 @@ struct App
         const INT_PTR result = DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_SETTINGS),
             window, SettingsProc, reinterpret_cast<LPARAM>(&dialog));
         RegCloseKey(startupKey);
-        if (result == IDOK) keys = dialog.keys;
+        if (result == IDOK)
+        {
+            keys = dialog.keys;
+            if (keys.runAsAdmin) PostMessageW(window, kElevationMessage, 0, 0);
+        }
         ++generation;
         paused = false;
         return result == IDOK;
@@ -611,6 +709,17 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     if (app)
     {
+        if (message == kElevationMessage)
+        {
+            if (!app->keys.runAsAdmin) return 0;
+            const auto elevation = EnsureElevated(false);
+            if (elevation != ElevationResult::Continue)
+            {
+                if (elevation == ElevationResult::Failed) Error(L"管理者権限で起動できません。");
+                DestroyWindow(window);
+            }
+            return 0;
+        }
         if (message == kSwitchMessage) { app->Switch(); return 0; }
         if (message == kTrayMessage)
         {
@@ -637,11 +746,22 @@ void Error(const wchar_t* message)
 }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int)
 {
     App app;
     app.instance = instance;
     if (!GetIniPath(app.ini)) { Error(L"EXEの配置フォルダを取得できません。"); return 1; }
+    const bool loaded = LoadKeys(app.ini, app.keys);
+    const bool relaunched = arguments && lstrcmpW(arguments, L"--elevated") == 0;
+    if ((loaded && app.keys.runAsAdmin) || relaunched)
+    {
+        const auto elevation = EnsureElevated(relaunched);
+        if (elevation != ElevationResult::Continue)
+        {
+            if (elevation == ElevationResult::Failed) Error(L"管理者権限で起動できません。");
+            return elevation == ElevationResult::Failed ? 1 : 0;
+        }
+    }
     WNDCLASSW cls{};
     cls.lpfnWndProc = WindowProc;
     cls.hInstance = instance;
@@ -650,6 +770,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     app.window = CreateWindowExW(WS_EX_TOOLWINDOW, kClass, L"switch_ime", WS_OVERLAPPED,
         0, 0, 0, 0, nullptr, nullptr, instance, &app);
     if (!app.window) { Error(L"アプリを初期化できません。"); return 1; }
+    // Explorer may run at a lower integrity level than this process.
+    if (!ChangeWindowMessageFilterEx(app.window, kTrayMessage, MSGFLT_ALLOW, nullptr) ||
+        (app.taskbarCreated && !ChangeWindowMessageFilterEx(app.window, app.taskbarCreated, MSGFLT_ALLOW, nullptr)))
+    {
+        Error(L"タスクトレイの通知を受信できません。");
+        DestroyWindow(app.window);
+        return 1;
+    }
     gApp = &app;
     for (UINT vk = 1; vk < 255; ++vk)
     {
@@ -677,7 +805,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
         if (!app.Settings()) { DestroyWindow(app.window); return 0; }
     }
-    else if (!LoadKeys(app.ini, app.keys))
+    else if (!loaded)
     {
         Error(L"INIのキー設定が無効です。異なる2つのキーを登録してください。");
         if (!app.Settings()) { DestroyWindow(app.window); return 0; }

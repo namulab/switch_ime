@@ -21,6 +21,10 @@ bin\x64\Release\tests\switch_ime_tests.exe
 bin\x64\Release\tests\switch_ime_smoke.exe
 ```
 
+The desktop smoke test uses its own INI with the administrator option off. Unit tests simulate elevation requests and never display UAC or start an elevated process.
+
+デスクトップテストは独立したINIで管理者起動をOFFにして実行します。単体テストは昇格要求を模擬し、UAC表示や昇格プロセスの起動は行いません。
+
 - `switch_ime_tests`: key filtering, repeat suppression, injected-input exclusion, IME decision table, INI round trips, settings save/cancel, and modal tray-menu handling. It creates `test-output` beside its own EXE. It does not install a global hook or send real keyboard input. Dialogs appear briefly and close automatically. An optional argument specifies a different existing parent location for test output.
 - `switch_ime_smoke`: hidden startup, tray registration, restoration after icon deletion plus a `TaskbarCreated` notification, and clean exit. Run on a normal Windows desktop; a sandbox may not have access to Explorer's tray. It launches an isolated copy of the app with F23/F24 settings, then closes it and removes the test copy. It neither changes the user's INI nor restarts Explorer, and it does not inject key input. An optional argument specifies the app EXE; the default is `..\switch_ime.exe` relative to the test executable directory.
 
