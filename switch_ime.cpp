@@ -158,6 +158,59 @@ bool GetElevation(bool& elevated)
 
 enum class ElevationResult { Continue, Restarted, Failed };
 
+enum class InstanceResult { Acquired, AlreadyRunning, Failed };
+
+struct SingleInstance
+{
+    HANDLE handle = nullptr;
+    SingleInstance() = default;
+    SingleInstance(const SingleInstance&) = delete;
+    SingleInstance& operator=(const SingleInstance&) = delete;
+    ~SingleInstance() { if (handle) CloseHandle(handle); }
+
+    InstanceResult Acquire(const wchar_t* name = L"Local\\namulab.switch_ime.Instance")
+    {
+        SetLastError(ERROR_SUCCESS);
+        // Presence is the lock. SYNCHRONIZE avoids requesting write access to
+        // an existing mutex created by an elevated process.
+        handle = CreateMutexExW(nullptr, name, 0, SYNCHRONIZE);
+        if (!handle) return InstanceResult::Failed;
+        if (GetLastError() != ERROR_ALREADY_EXISTS) return InstanceResult::Acquired;
+        CloseHandle(handle);
+        handle = nullptr;
+        return InstanceResult::AlreadyRunning;
+    }
+};
+
+bool ReadElevationParent(const wchar_t* arguments, DWORD& parent)
+{
+    parent = 0;
+    if (!arguments || !*arguments) return true;
+    constexpr wchar_t prefix[] = L"--elevated ";
+    constexpr size_t length = sizeof(prefix) / sizeof(wchar_t) - 1;
+    if (std::wcsncmp(arguments, prefix, length) != 0) return false;
+    const wchar_t* number = arguments + length;
+    if (*number < L'0' || *number > L'9') return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::wcstoul(number, &end, 10);
+    if (errno || !value || !end || *end || value == GetCurrentProcessId()) return false;
+    parent = value;
+    return true;
+}
+
+bool WaitForElevationParent(DWORD parent)
+{
+    if (!parent) return true;
+    bool elevated = false;
+    if (!GetElevation(elevated) || !elevated) return false;
+    const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, parent);
+    if (!process) return GetLastError() == ERROR_INVALID_PARAMETER; // Already exited.
+    const DWORD waited = WaitForSingleObject(process, 10000);
+    CloseHandle(process);
+    return waited == WAIT_OBJECT_0;
+}
+
 ElevationResult EnsureElevated(bool relaunched)
 {
     bool elevated = false;
@@ -174,7 +227,8 @@ ElevationResult EnsureElevated(bool relaunched)
     execute.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
     execute.lpVerb = L"runas";
     execute.lpFile = exe.c_str();
-    execute.lpParameters = L"--elevated";
+    const std::wstring parameters = L"--elevated " + std::to_wstring(GetCurrentProcessId());
+    execute.lpParameters = parameters.c_str();
     execute.nShow = SW_HIDE;
     const bool started = ShellExecuteExW(&execute) != FALSE;
     const DWORD error = started ? ERROR_SUCCESS : GetLastError();
@@ -748,11 +802,27 @@ void Error(const wchar_t* message)
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int)
 {
+    DWORD parent = 0;
+    if (!ReadElevationParent(arguments, parent) || !WaitForElevationParent(parent))
+    {
+        Error(L"管理者権限での再起動を完了できません。");
+        return 1;
+    }
+    // Declared before App so hooks and the tray are removed before releasing
+    // the instance handle, including on failed startup or normal shutdown.
+    SingleInstance singleInstance;
+    const auto acquired = singleInstance.Acquire();
+    if (acquired == InstanceResult::AlreadyRunning) return 0;
+    if (acquired != InstanceResult::Acquired)
+    {
+        Error(L"多重起動の確認に失敗しました。");
+        return 1;
+    }
     App app;
     app.instance = instance;
     if (!GetIniPath(app.ini)) { Error(L"EXEの配置フォルダを取得できません。"); return 1; }
     const bool loaded = LoadKeys(app.ini, app.keys);
-    const bool relaunched = arguments && lstrcmpW(arguments, L"--elevated") == 0;
+    const bool relaunched = parent != 0;
     if ((loaded && app.keys.runAsAdmin) || relaunched)
     {
         const auto elevation = EnsureElevated(relaunched);

@@ -49,7 +49,9 @@ int wmain(int argc, wchar_t** argv)
     const auto folder = testsFolder / (L"desktop-smoke-" + std::to_wstring(GetCurrentProcessId()));
     if (!CreateDirectoryW(folder.c_str(), nullptr)) return 1;
     const auto exe = folder / L"switch_ime.exe", ini = folder / L"switch_ime.ini";
+    const auto duplicateExe = folder / L"duplicate.exe";
     PROCESS_INFORMATION child{};
+    PROCESS_INFORMATION duplicate{};
     bool passed = false;
     do
     {
@@ -71,6 +73,15 @@ int wmain(int argc, wchar_t** argv)
         } while (GetTickCount64() < deadline && WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT);
         if (!search.window || !HasTray(search.window) || IsWindowVisible(search.window)) break;
         std::puts("PASS: normal startup stays hidden and registers tray icon");
+        if (!CopyFileW(source.c_str(), duplicateExe.c_str(), TRUE)) break;
+        std::wstring duplicateCommand = L"\"" + duplicateExe.wstring() + L"\"";
+        if (!CreateProcessW(duplicateExe.c_str(), duplicateCommand.data(), nullptr, nullptr, FALSE, 0,
+            nullptr, folder.c_str(), &startup, &duplicate)) break;
+        DWORD duplicateExit = 1;
+        if (WaitForSingleObject(duplicate.hProcess, 3000) != WAIT_OBJECT_0 ||
+            !GetExitCodeProcess(duplicate.hProcess, &duplicateExit) || duplicateExit != 0 ||
+            WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT || !HasTray(search.window)) break;
+        std::puts("PASS: duplicate executable exits while original remains resident");
         NOTIFYICONDATAW icon{};
         icon.cbSize = sizeof(icon);
         icon.hWnd = search.window;
@@ -97,6 +108,17 @@ int wmain(int argc, wchar_t** argv)
         CloseHandle(child.hThread);
         CloseHandle(child.hProcess);
     }
+    if (duplicate.hProcess)
+    {
+        if (WaitForSingleObject(duplicate.hProcess, 0) == WAIT_TIMEOUT)
+        {
+            TerminateProcess(duplicate.hProcess, 1);
+            WaitForSingleObject(duplicate.hProcess, 3000);
+        }
+        CloseHandle(duplicate.hThread);
+        CloseHandle(duplicate.hProcess);
+    }
+    DeleteFileW(duplicateExe.c_str());
     DeleteFileW(exe.c_str());
     DeleteFileW(ini.c_str());
     RemoveDirectoryW(folder.c_str());

@@ -20,8 +20,10 @@ BOOL WINAPI TestGetTokenInformation(HANDLE token, TOKEN_INFORMATION_CLASS kind,
 BOOL WINAPI TestShellExecuteEx(SHELLEXECUTEINFOW* execute)
 {
     ++testElevationLaunches;
+    wchar_t expected[64]{};
+    wsprintfW(expected, L"--elevated %lu", GetCurrentProcessId());
     testElevationCommand = lstrcmpW(execute->lpVerb, L"runas") == 0 &&
-        execute->lpFile && *execute->lpFile && lstrcmpW(execute->lpParameters, L"--elevated") == 0 &&
+        execute->lpFile && *execute->lpFile && lstrcmpW(execute->lpParameters, expected) == 0 &&
         (execute->fMask & SEE_MASK_NOASYNC) && execute->nShow == SW_HIDE;
     SetLastError(testElevationLaunchError);
     return testElevationLaunchError == ERROR_SUCCESS;
@@ -67,6 +69,34 @@ void Check(bool condition, const char* description)
 {
     if (!condition) { std::fprintf(stderr, "FAIL: %s\n", description); std::exit(1); }
     std::printf("PASS: %s\n", description);
+}
+
+void CheckSingleInstance()
+{
+    const std::wstring name = L"Local\\switch_ime.Test.Instance." + std::to_wstring(GetCurrentProcessId());
+    {
+        SingleInstance first;
+        Check(first.Acquire(name.c_str()) == InstanceResult::Acquired, "first instance acquires named mutex");
+        SingleInstance second;
+        Check(second.Acquire(name.c_str()) == InstanceResult::AlreadyRunning,
+            "second instance is rejected without affecting first");
+    }
+    SingleInstance next;
+    Check(next.Acquire(name.c_str()) == InstanceResult::Acquired,
+        "instance guard releases on exit and permits a new instance");
+    DWORD parent = 1;
+    Check(ReadElevationParent(L"", parent) && parent == 0, "normal startup has no elevation parent");
+    const std::wstring argument = L"--elevated " + std::to_wstring(GetCurrentProcessId() + 1);
+    Check(ReadElevationParent(argument.c_str(), parent) && parent == GetCurrentProcessId() + 1,
+        "elevated restart identifies the process that must exit first");
+    Check(!ReadElevationParent(L"--elevated", parent) && !ReadElevationParent(L"--elevated 0", parent) &&
+        !ReadElevationParent(L"--elevated -1", parent) && !ReadElevationParent(L"--elevated 12x", parent),
+        "invalid restart parent is rejected");
+    const std::wstring self = L"--elevated " + std::to_wstring(GetCurrentProcessId());
+    Check(!ReadElevationParent(self.c_str(), parent), "restart cannot wait on itself");
+    testElevation = 0;
+    Check(!WaitForElevationParent(GetCurrentProcessId()), "restart marker cannot bypass elevation verification");
+    testElevation = -1;
 }
 
 void CheckElevation()
@@ -404,6 +434,7 @@ int wmain(int argc, wchar_t** argv)
     const std::wstring ini = folder + L"\\設定.ini";
     screenshot = folder + L"\\settings.bmp";
     DeleteFileW(ini.c_str());
+    CheckSingleInstance();
     CheckElevation();
     CheckExecutableVersion();
     CheckFilter();
