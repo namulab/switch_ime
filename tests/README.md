@@ -23,9 +23,17 @@ bin\x64\Release\tests\switch_ime_smoke.exe
 
 The desktop smoke test uses its own INI with the administrator option off. It also launches a second copy under a different EXE name and checks that only the original stays resident. Unit tests simulate elevation requests and never display UAC or start an elevated process.
 
+Unit tests run a simulated hook on the main thread and the real settings dialog on a worker thread. They deliberately block settings-registry access and INI flushing, and verify that IME queries and simulated SendInput still run on the main thread before I/O is released. They also check settings-field capture, atomic key updates, repeated tray-menu use, cancellation, and worker cleanup on exit. No real keyboard input is injected.
+
+Startup tests verify the session-user SID lookup and elevated registry routing, block registry access when identification fails, and check the recovery message and disabled checkbox. Registry-routing failures are simulated; no real startup entry is changed. Elevation using a different administrator account still requires manual verification.
+
+Intent tests cover window/focus changes between acceptance and execution, changes during the IME query, ON/OFF ordering when a fresh query is needed, and preservation of accepted requests across key-setting updates. Settings tests verify that the main thread applies saved keys before the dialog closes. IME responses and SendInput are simulated.
+
 デスクトップテストは独立したINIで管理者起動をOFFにして実行します。別のEXE名のコピーも起動し、先に起動したアプリだけが常駐し続けることを確認します。単体テストは昇格要求を模擬し、UAC表示や昇格プロセスの起動は行いません。
 
-- `switch_ime_tests`: key filtering, repeat suppression, injected-input exclusion, IME decision table, INI round trips, settings save/cancel, and modal tray-menu handling. It creates `test-output` beside its own EXE. It does not install a global hook or send real keyboard input. Dialogs appear briefly and close automatically. An optional argument specifies a different existing parent location for test output.
+単体テストではメインスレッドのフックを模擬し、実際の設定画面を別スレッドで実行します。設定のレジストリアクセスやINI保存を意図的に待機させ、その間もメインスレッドでIME状態取得と模擬SendInputが進むことを確認します。キー登録中の切り替え停止、設定の一括更新、トレイメニューの繰り返し操作、キャンセル、終了時のスレッド後始末も確認します。実際のキー入力は送信しません。
+
+- `switch_ime_tests`: key filtering, repeat suppression, injected-input exclusion, IME decision table, INI round trips, settings save/cancel, and tray-menu handling during settings. It creates `test-output` beside its own EXE. It does not install a global hook or send real keyboard input. Dialogs appear briefly and close automatically. An optional argument specifies a different existing parent location for test output.
 - `switch_ime_smoke`: hidden startup, tray registration, restoration after icon deletion plus a `TaskbarCreated` notification, and clean exit. Run on a normal Windows desktop; a sandbox may not have access to Explorer's tray. It launches an isolated copy of the app with F23/F24 settings, then closes it and removes the test copy. It neither changes the user's INI nor restarts Explorer, and it does not inject key input. An optional argument specifies the app EXE; the default is `..\switch_ime.exe` relative to the test executable directory.
 
 - `switch_ime_tests`：キー判定、リピート抑止、注入入力の除外、IME判定、INI読み書き、設定の保存・キャンセル、設定中のトレイ操作を確認します。テストEXEの横に `test-output` を作成します。実キー送信やグローバルフック設置は行いません。設定画面は一時表示して自動で閉じます。引数で出力先フォルダを指定することもできます。

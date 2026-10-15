@@ -6,6 +6,9 @@
 #include <shellapi.h>
 #include <objbase.h>
 #include <commctrl.h>
+#include <process.h>
+#include <wtsapi32.h>
+#include <sddl.h>
 #include <cwchar>
 #include <cstdio>
 #include <cerrno>
@@ -14,6 +17,7 @@
 #include <vector>
 #include <deque>
 #include <algorithm>
+#include <atomic>
 #include "resource.h"
 
 namespace
@@ -23,6 +27,22 @@ constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kSwitchMessage = WM_APP + 2; // Notification to our own HWND only.
 constexpr UINT kCaptureKey = WM_APP + 3;
 constexpr UINT kElevationMessage = WM_APP + 4;
+constexpr UINT kStartupErrorMessage = WM_APP + 5;
+constexpr UINT kSettingsClosedMessage = WM_APP + 6;
+constexpr UINT kShowSettingsMessage = WM_APP + 7;
+constexpr UINT kApplySettingsMessage = WM_APP + 8;
+constexpr wchar_t kStartupUserError[] =
+    L"管理者権限で実行中ですが\n"
+    L"サインイン中のユーザーを取得できなかったため\n"
+    L"自動起動を設定できませんでした。\n\n"
+    L"通常のユーザー権限で起動し直し\n"
+    L"（UACの確認をキャンセルして）\n"
+    L"自動起動を設定し直してください。";
+constexpr wchar_t kStartupRegistryError[] =
+    L"自動起動の設定にアクセスできません。\n\n"
+    L"通常のユーザー権限で起動し直し\n"
+    L"（UACの確認をキャンセルして）\n"
+    L"自動起動を設定し直してください。";
 constexpr wchar_t kAdminHelp[] = L"管理者権限で起動されたアプリ上でもIME切り替えを有効にしたい場合は、このオプションをONにします。";
 constexpr wchar_t kStartupHelp[] = L"現在サインインしているユーザーにのみ適用されます。";
 void Error(const wchar_t* message);
@@ -53,18 +73,25 @@ struct Target
     }
 };
 
-bool CaptureTarget(Target& target)
+bool CaptureTarget(Target& target, bool* changed = nullptr)
 {
+    if (changed) *changed = false;
     target = {};
     target.foreground = GetForegroundWindow();
     if (!target.foreground) return false;
     target.thread = GetWindowThreadProcessId(target.foreground, nullptr);
     GUITHREADINFO info{};
     info.cbSize = sizeof(info);
-    if (!target.thread || !GetGUIThreadInfo(target.thread, &info) || !info.hwndFocus) return false;
+    if (!target.thread || !GetGUIThreadInfo(target.thread, &info) || !info.hwndFocus)
+    {
+        if (changed) *changed = GetForegroundWindow() != target.foreground;
+        return false;
+    }
     target.focus = info.hwndFocus;
     target.layout = GetKeyboardLayout(target.thread);
-    return GetForegroundWindow() == target.foreground;
+    const bool stable = GetForegroundWindow() == target.foreground;
+    if (changed) *changed = !stable;
+    return stable;
 }
 
 bool QueryIme(HWND ime, WPARAM command, DWORD_PTR& response)
@@ -75,8 +102,9 @@ bool QueryIme(HWND ime, WPARAM command, DWORD_PTR& response)
         SMTO_BLOCK | SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 20, &response) != 0;
 }
 
-ImeState ReadIme(const Target& target)
+ImeState ReadIme(const Target& target, bool* changed = nullptr)
 {
+    if (changed) *changed = false;
     const HWND ime = ImmGetDefaultIMEWnd(target.focus);
     if (!ime) return ImeState::Unknown;
     DWORD_PTR open = 0;
@@ -98,8 +126,17 @@ ImeState ReadIme(const Target& target)
             state = ImeState::Japanese;
     }
     Target after{};
-    if (!CaptureTarget(after) || !(after == target) ||
-        ImmGetDefaultIMEWnd(after.focus) != ime) return ImeState::Unknown;
+    bool moved = false;
+    if (!CaptureTarget(after, &moved))
+    {
+        if (changed) *changed = moved;
+        return ImeState::Unknown;
+    }
+    if (!(after == target) || ImmGetDefaultIMEWnd(after.focus) != ime)
+    {
+        if (changed) *changed = true;
+        return ImeState::Unknown;
+    }
     return state;
 }
 
@@ -307,7 +344,70 @@ std::wstring KeyName(UINT vk, LPARAM keyData = 0)
     return name;
 }
 
-// Only our named value is changed. The current-user Run key needs no elevation.
+// Resolve the user of this session, not the account used for UAC credentials.
+bool SessionUserSid(std::wstring& sid)
+{
+    auto query = [](WTS_INFO_CLASS kind, std::wstring& value)
+    {
+        LPWSTR buffer = nullptr;
+        DWORD bytes = 0;
+        const BOOL success = WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION, kind, &buffer, &bytes);
+        bool valid = success && buffer && bytes >= sizeof(wchar_t) &&
+            bytes % sizeof(wchar_t) == 0;
+        if (valid)
+        {
+            const size_t count = bytes / sizeof(wchar_t);
+            const size_t length = wcsnlen_s(buffer, count);
+            valid = length > 0 && length < count;
+            if (valid) value.assign(buffer, length);
+        }
+        if (buffer) WTSFreeMemory(buffer);
+        return valid;
+    };
+    std::wstring user, domain;
+    if (!query(WTSUserName, user) || !query(WTSDomainName, domain)) return false;
+    const std::wstring account = domain + L"\\" + user;
+    DWORD sidBytes = 0, domainChars = 0;
+    SID_NAME_USE use{};
+    LookupAccountNameW(nullptr, account.c_str(), nullptr, &sidBytes, nullptr, &domainChars, &use);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !sidBytes || !domainChars) return false;
+    std::vector<BYTE> binarySid(sidBytes);
+    std::vector<wchar_t> resolvedDomain(domainChars);
+    if (!LookupAccountNameW(nullptr, account.c_str(), binarySid.data(), &sidBytes,
+        resolvedDomain.data(), &domainChars, &use) || use != SidTypeUser ||
+        !IsValidSid(binarySid.data())) return false;
+    LPWSTR text = nullptr;
+    if (!ConvertSidToStringSidW(binarySid.data(), &text)) return false;
+    sid = text;
+    LocalFree(text);
+    return true;
+}
+
+bool OpenStartupKey(HKEY& key, const wchar_t*& error)
+{
+    key = nullptr;
+    error = kStartupRegistryError;
+    bool elevated = false;
+    if (!GetElevation(elevated)) return false;
+    HKEY root = HKEY_CURRENT_USER;
+    if (elevated)
+    {
+        std::wstring sid;
+        if (!SessionUserSid(sid)) { error = kStartupUserError; return false; }
+        // Open only an already-loaded profile. Never create a user hive or fall back to HKCU.
+        if (RegOpenKeyExW(HKEY_USERS, sid.c_str(), 0, KEY_CREATE_SUB_KEY, &root) != ERROR_SUCCESS)
+            return false;
+    }
+    const LSTATUS status = RegCreateKeyExW(root, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (elevated) RegCloseKey(root);
+    if (status != ERROR_SUCCESS) { key = nullptr; return false; }
+    error = nullptr;
+    return true;
+}
+
+// Only our named value is changed.
 struct StartupEntry
 {
     bool exists = false;
@@ -359,10 +459,17 @@ struct DialogState
     HKEY startupKey = nullptr;
     StartupEntry originalStartup;
     HWND tooltip = nullptr;
+    const wchar_t* startupError = nullptr;
+    std::atomic<HWND>* visibleDialog = nullptr;
+    std::atomic<bool>* closing = nullptr;
+    HWND applyWindow = nullptr;
 };
-WNDPROC gEditProc = nullptr;
-HWND gCaptureEdits[2]{};
-HWND gSettingsDialog = nullptr;
+thread_local WNDPROC gEditProc = nullptr;
+thread_local HWND gCaptureEdits[2]{};
+thread_local HWND gSettingsDialog = nullptr;
+struct KeyboardMonitor;
+thread_local KeyboardMonitor* gSettingsMonitor = nullptr;
+void PublishKeyboardSettings();
 
 void PositionSettings(HWND dialog, const POINT& point)
 {
@@ -493,6 +600,7 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
     {
         state = reinterpret_cast<DialogState*>(lParam);
         gSettingsDialog = dialog;
+        if (state->visibleDialog) state->visibleDialog->store(dialog);
         SetWindowLongPtrW(dialog, DWLP_USER, lParam);
         NONCLIENTMETRICSW metrics{};
         metrics.cbSize = sizeof(metrics);
@@ -504,9 +612,9 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
         CreateSettingsTooltips(dialog, *state);
         if (state->startupKey && !ReadStartup(state->startupKey, state->originalStartup))
         {
-            MessageBoxW(dialog, L"自動起動の登録状態を取得できません。", L"switch_ime", MB_OK | MB_ICONERROR);
-            EndDialog(dialog, IDCANCEL);
-            return TRUE;
+            state->startupKey = nullptr;
+            state->originalStartup = {};
+            state->startupError = kStartupRegistryError;
         }
         CheckDlgButton(dialog, IDC_STARTUP, state->originalStartup.exists ? BST_CHECKED : BST_UNCHECKED);
         EnableWindow(GetDlgItem(dialog, IDC_STARTUP), state->startupKey != nullptr);
@@ -519,8 +627,24 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
             if (!gEditProc) gEditProc = previous;
             SetWindowTextW(edit, KeyName(id == IDC_ON_KEY ? state->keys.on : state->keys.off).c_str());
         }
+        PublishKeyboardSettings();
         if (state->anchor) PositionSettings(dialog, *state->anchor);
         SetForegroundWindow(dialog);
+        if (state->startupError) PostMessageW(dialog, kStartupErrorMessage, 0, 0);
+        if (state->closing && state->closing->load()) PostMessageW(dialog, WM_CLOSE, 0, 0);
+        return TRUE;
+    }
+    if (message == kShowSettingsMessage)
+    {
+        ShowWindow(dialog, SW_RESTORE);
+        PositionSettings(dialog, {static_cast<LONG>(wParam), static_cast<LONG>(lParam)});
+        SetForegroundWindow(dialog);
+        return TRUE;
+    }
+    if (message == kStartupErrorMessage && state && state->startupError)
+    {
+        MessageBoxW(dialog, state->startupError, L"switch_ime", MB_OK | MB_ICONERROR);
+        state->startupError = nullptr;
         return TRUE;
     }
     if (message == WM_COMMAND && state)
@@ -558,6 +682,9 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
                     L"switch_ime", MB_OK | MB_ICONERROR);
                 return TRUE;
             }
+            // Notify only our own main window; do not close until the new mapping is applied.
+            if (state->applyWindow) SendMessageW(state->applyWindow, kApplySettingsMessage,
+                0, reinterpret_cast<LPARAM>(&state->keys));
             EndDialog(dialog, IDOK);
             return TRUE;
         }
@@ -568,7 +695,9 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
     {
         if (state && state->tooltip) { DestroyWindow(state->tooltip); state->tooltip = nullptr; }
         gCaptureEdits[0] = gCaptureEdits[1] = nullptr;
+        PublishKeyboardSettings();
         if (gSettingsDialog == dialog) gSettingsDialog = nullptr;
+        if (state && state->visibleDialog) state->visibleDialog->store(nullptr);
     }
     if (message == WM_NCDESTROY && state && state->font)
     {
@@ -611,81 +740,316 @@ struct KeyFilter
     }
 };
 
-struct Request { bool turnOn; Target target; unsigned generation; };
-struct App;
-App* gApp = nullptr;
+struct Request { bool turnOn; };
+struct KeyboardSettings
+{
+    Keys keys;
+    bool paused = false;
+    HWND edits[2]{};
+    HWND window = nullptr;
+    DWORD uiThread = 0;
+};
+
+struct KeyboardMonitor;
+thread_local KeyboardMonitor* gKeyboardMonitor = nullptr;
 LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam);
+
+struct KeyboardMonitor
+{
+    SRWLOCK lock = SRWLOCK_INIT;
+    KeyboardSettings settings;
+    std::deque<Request> requests;
+    KeyFilter filter; // Accessed only by the main thread.
+    HHOOK hook = nullptr;
+
+    ~KeyboardMonitor() { Stop(); }
+
+    void Publish(const KeyboardSettings& next)
+    {
+        AcquireSRWLockExclusive(&lock);
+        settings = next;
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    KeyboardSettings Snapshot()
+    {
+        AcquireSRWLockShared(&lock);
+        const auto result = settings;
+        ReleaseSRWLockShared(&lock);
+        return result;
+    }
+
+    void Enqueue(bool turnOn, const KeyboardSettings& current)
+    {
+        AcquireSRWLockExclusive(&lock);
+        requests.push_back({turnOn});
+        ReleaseSRWLockExclusive(&lock);
+        if (!PostMessageW(current.window, kSwitchMessage, 0, 0))
+        {
+            AcquireSRWLockExclusive(&lock);
+            if (!requests.empty()) requests.pop_back();
+            ReleaseSRWLockExclusive(&lock);
+        }
+    }
+
+    void Defer(const Request& request)
+    {
+        // Keep the intent and its position in the sequence; query the new input target next.
+        AcquireSRWLockExclusive(&lock);
+        requests.push_front(request);
+        const HWND window = settings.window;
+        ReleaseSRWLockExclusive(&lock);
+        PostMessageW(window, kSwitchMessage, 0, 0);
+    }
+
+    bool Take(Request& request)
+    {
+        AcquireSRWLockExclusive(&lock);
+        const bool available = !requests.empty();
+        if (available) { request = requests.front(); requests.pop_front(); }
+        ReleaseSRWLockExclusive(&lock);
+        return available;
+    }
+
+    void UpdateKeys(const Keys& keys, bool paused, HWND window)
+    {
+        AcquireSRWLockExclusive(&lock);
+        settings.keys = keys;
+        settings.paused = paused;
+        settings.window = window;
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    void CaptureFields(HWND on, HWND off, DWORD threadId)
+    {
+        AcquireSRWLockExclusive(&lock);
+        settings.edits[0] = on;
+        settings.edits[1] = off;
+        settings.uiThread = threadId;
+        ReleaseSRWLockExclusive(&lock);
+    }
+
+    bool Start()
+    {
+        gKeyboardMonitor = this;
+        for (UINT vk = 1; vk < 255; ++vk)
+        {
+            if (vk >= 0xF0 && vk <= 0xFD) continue;
+            const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
+            if (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000)
+                filter.down[KeyFilter::Index(vk, scan & 0xFF, (scan & 0xFF00) != 0)] = true;
+        }
+        hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
+        if (!hook) gKeyboardMonitor = nullptr;
+        return hook != nullptr;
+    }
+
+    void Stop()
+    {
+        if (hook) { UnhookWindowsHookEx(hook); hook = nullptr; }
+        if (gKeyboardMonitor == this) gKeyboardMonitor = nullptr;
+    }
+
+};
+
+// The main thread owns this object. The worker owns its dialog and file/registry I/O.
+// Results are read only after joining the worker; HWND and close requests are atomic.
+struct SettingsTask
+{
+    HANDLE thread = nullptr;
+    HINSTANCE instance = nullptr;
+    HWND mainWindow = nullptr;
+    KeyboardMonitor* monitor = nullptr;
+    Keys keys;
+    std::wstring ini;
+    POINT anchor{};
+    bool anchored = false;
+    bool initial = false;
+    INT_PTR result = IDCANCEL;
+    std::atomic<HWND> dialog{nullptr};
+    std::atomic<bool> closing{false};
+
+    static unsigned __stdcall Run(void* context)
+    {
+        auto& task = *static_cast<SettingsTask*>(context);
+        gSettingsMonitor = task.monitor;
+        HKEY startupKey = nullptr;
+        const wchar_t* error = nullptr;
+        OpenStartupKey(startupKey, error);
+        if (!task.closing.load())
+        {
+            DialogState state{task.keys, &task.ini, nullptr, task.anchored ? &task.anchor : nullptr};
+            state.startupKey = startupKey;
+            state.startupError = error;
+            state.visibleDialog = &task.dialog;
+            state.closing = &task.closing;
+            state.applyWindow = task.mainWindow;
+            // No cross-thread owner: never disable or attach the main thread's input queue.
+            task.result = DialogBoxParamW(task.instance, MAKEINTRESOURCEW(IDD_SETTINGS),
+                nullptr, SettingsProc, reinterpret_cast<LPARAM>(&state));
+            if (task.result == IDOK) task.keys = state.keys;
+        }
+        if (startupKey) RegCloseKey(startupKey);
+        gSettingsMonitor = nullptr;
+        PostMessageW(task.mainWindow, kSettingsClosedMessage, 0, 0);
+        return 0;
+    }
+
+    bool Start()
+    {
+        result = IDCANCEL;
+        closing.store(false);
+        thread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, Run, this, 0, nullptr));
+        return thread != nullptr;
+    }
+
+    void Close()
+    {
+        closing.store(true);
+        if (const HWND view = dialog.load()) PostMessageW(view, WM_CLOSE, 0, 0);
+    }
+
+    void Join()
+    {
+        if (!thread) return;
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+        thread = nullptr;
+    }
+
+    ~SettingsTask() { Close(); Join(); }
+};
 
 struct App
 {
     HINSTANCE instance = nullptr;
     HWND window = nullptr;
-    HHOOK hook = nullptr;
     Keys keys;
-    KeyFilter filter;
+    KeyboardMonitor monitor;
+    SettingsTask settings;
+    bool exiting = false;
     std::wstring ini;
     HICON icon = nullptr;
     NOTIFYICONDATAW tray{};
     bool trayAdded = false;
     bool paused = false;
-    unsigned generation = 0;
-    std::deque<Request> requests;
     UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     ~App()
     {
-        if (hook) UnhookWindowsHookEx(hook);
-        gApp = nullptr;
+        monitor.Stop();
+        settings.Close();
+        settings.Join();
         if (trayAdded) Shell_NotifyIconW(NIM_DELETE, &tray);
         if (icon) DestroyIcon(icon);
     }
 
-    bool Settings(const POINT* anchor = nullptr)
+    bool AddTray()
     {
-        HKEY startupKey = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &startupKey, nullptr) != ERROR_SUCCESS)
+        icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_TRAY), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+        tray.cbSize = sizeof(tray);
+        tray.hWnd = window;
+        tray.uID = 1;
+        tray.uFlags = NIF_ICON | NIF_MESSAGE;
+        tray.uCallbackMessage = kTrayMessage;
+        tray.hIcon = icon;
+        if (!icon)
         {
-            MessageBoxW(window, L"自動起動の設定を開けません。", L"switch_ime", MB_OK | MB_ICONERROR);
+            Error(L"トレイアイコンを作成できません。");
             return false;
         }
-        paused = true;
-        ++generation;
-        DialogState dialog{keys, &ini, nullptr, anchor};
-        dialog.startupKey = startupKey;
-        const INT_PTR result = DialogBoxParamW(instance, MAKEINTRESOURCEW(IDD_SETTINGS),
-            window, SettingsProc, reinterpret_cast<LPARAM>(&dialog));
-        RegCloseKey(startupKey);
-        if (result == IDOK)
+        trayAdded = Shell_NotifyIconW(NIM_ADD, &tray) != FALSE;
+        if (!trayAdded)
         {
-            keys = dialog.keys;
-            if (keys.runAsAdmin) PostMessageW(window, kElevationMessage, 0, 0);
+            Error(L"タスクトレイにアイコンを登録できません。");
+            return false;
         }
-        ++generation;
-        paused = false;
-        return result == IDOK;
+        return true;
     }
 
-    void Enqueue(bool turnOn)
+    void Publish()
     {
-        Target target{};
-        if (!CaptureTarget(target)) return;
-        requests.push_back({turnOn, target, generation});
-        if (!PostMessageW(window, kSwitchMessage, 0, 0)) requests.pop_back();
+        monitor.UpdateKeys(keys, paused, window);
+    }
+
+    bool Settings(const POINT* anchor = nullptr)
+    {
+        if (settings.thread)
+        {
+            if (const HWND view = settings.dialog.load())
+            {
+                POINT point{};
+                if (anchor) point = *anchor;
+                else GetCursorPos(&point);
+                PostMessageW(view, kShowSettingsMessage,
+                    static_cast<WPARAM>(point.x), static_cast<LPARAM>(point.y));
+            }
+            return true;
+        }
+        settings.instance = instance;
+        settings.mainWindow = window;
+        settings.monitor = &monitor;
+        settings.keys = keys;
+        settings.ini = ini;
+        settings.initial = !keys.Valid();
+        settings.anchored = anchor != nullptr;
+        if (anchor) settings.anchor = *anchor;
+        paused = !keys.Valid();
+        Publish();
+        if (settings.Start()) return true;
+        Error(L"設定画面を開始できません。");
+        return false;
+    }
+
+    void SettingsClosed()
+    {
+        if (!settings.thread) return;
+        settings.Join();
+        if (settings.result == -1) Error(L"設定画面を表示できません。");
+        if (exiting || (settings.initial && settings.result != IDOK))
+        {
+            DestroyWindow(window);
+            return;
+        }
+        paused = !keys.Valid();
+        Publish();
+        if (settings.initial && !AddTray()) { DestroyWindow(window); return; }
+        if (settings.result == IDOK && keys.runAsAdmin) PostMessageW(window, kElevationMessage, 0, 0);
+    }
+
+    void Exit()
+    {
+        exiting = true;
+        if (settings.thread) settings.Close();
+        else DestroyWindow(window);
     }
 
     void Switch()
     {
-        if (requests.empty()) return;
-        const Request request = requests.front();
-        requests.pop_front();
-        if (paused || request.generation != generation) return;
+        Request request{};
+        if (!monitor.Take(request)) return;
         Target current{};
-        if (!CaptureTarget(current) || !(current == request.target)) return;
-        const ImeState state = ReadIme(current); // Read only for a registered physical key press.
+        bool changed = false;
+        if (!CaptureTarget(current, &changed))
+        {
+            if (changed) monitor.Defer(request);
+            return;
+        }
+        bool readTargetChanged = false;
+        const ImeState state = ReadIme(current, &readTargetChanged);
         Target finalTarget{};
-        if (!NeedsSwitch(request.turnOn, state) || !CaptureTarget(finalTarget) ||
-            !(finalTarget == current)) return;
+        if (!CaptureTarget(finalTarget, &changed))
+        {
+            if (changed) monitor.Defer(request);
+            return;
+        }
+        if (readTargetChanged || !(finalTarget == current))
+        {
+            monitor.Defer(request);
+            return;
+        }
+        if (!NeedsSwitch(request.turnOn, state)) return;
         INPUT inputs[2]{};
         MakeInputs(request.turnOn, inputs);
         SendInput(2, inputs, sizeof(INPUT)); // One attempt, without fallback or retry.
@@ -699,9 +1063,7 @@ struct App
         AppendMenuW(menu, MF_STRING, kExitCommand, L"終了");
         POINT point{};
         GetCursorPos(&point);
-        // The hidden owner is disabled while DialogBox runs. Use the existing
-        // dialog as the menu owner so tray interaction remains available.
-        const HWND owner = gSettingsDialog ? gSettingsDialog : window;
+        const HWND owner = window;
         SetForegroundWindow(owner);
         const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             point.x, point.y, 0, owner, nullptr);
@@ -711,34 +1073,37 @@ struct App
         {
             POINT selected = point;
             GetCursorPos(&selected);
-            if (gSettingsDialog)
-            {
-                ShowWindow(gSettingsDialog, SW_RESTORE);
-                PositionSettings(gSettingsDialog, selected);
-                SetForegroundWindow(gSettingsDialog);
-            }
-            else Settings(&selected);
+            Settings(&selected);
         }
-        else if (command == kExitCommand)
-        {
-            if (gSettingsDialog) EndDialog(gSettingsDialog, IDCANCEL);
-            DestroyWindow(window);
-        }
+        else if (command == kExitCommand) Exit();
     }
 };
 
+void PublishKeyboardSettings()
+{
+    if (gSettingsMonitor) gSettingsMonitor->CaptureFields(
+        gCaptureEdits[0], gCaptureEdits[1], GetCurrentThreadId());
+}
+
 LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    if (code == HC_ACTION && gApp && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
+    if (code == HC_ACTION && gKeyboardMonitor && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
         wParam == WM_KEYUP || wParam == WM_SYSKEYUP))
     {
         const auto& event = *reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (event.flags & LLKHF_INJECTED) return CallNextHookEx(nullptr, code, wParam, lParam);
         const bool keyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
-        const HWND focus = GetFocus();
-        const bool capture = gApp->paused && focus &&
-            (focus == gCaptureEdits[0] || focus == gCaptureEdits[1]);
-        const auto decision = gApp->filter.Process(event.vkCode, keyDown,
-            (event.flags & LLKHF_INJECTED) != 0, gApp->paused, gApp->keys, capture,
+        auto& monitor = *gKeyboardMonitor;
+        const auto current = monitor.Snapshot();
+        GUITHREADINFO gui{};
+        gui.cbSize = sizeof(gui);
+        const HWND focus = (current.edits[0] || current.edits[1]) && current.uiThread &&
+            GetWindowThreadProcessId(GetForegroundWindow(), nullptr) == current.uiThread &&
+            GetGUIThreadInfo(current.uiThread, &gui)
+            ? gui.hwndFocus : nullptr;
+        const bool capture = focus && (focus == current.edits[0] || focus == current.edits[1]);
+        const auto decision = monitor.filter.Process(event.vkCode, keyDown,
+            (event.flags & LLKHF_INJECTED) != 0, current.paused, current.keys, capture,
             event.scanCode, (event.flags & LLKHF_EXTENDED) != 0);
         if (capture && keyDown && decision.consume)
         {
@@ -746,7 +1111,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wParam, LPARAM lParam)
             if (event.flags & LLKHF_EXTENDED) data |= static_cast<LPARAM>(1) << 24;
             PostMessageW(focus, kCaptureKey, event.vkCode, data);
         }
-        if (decision.request) gApp->Enqueue(decision.turnOn);
+        if (decision.request) monitor.Enqueue(decision.turnOn, current);
         if (decision.consume) return 1;
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -763,6 +1128,15 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     if (app)
     {
+        if (message == kApplySettingsMessage)
+        {
+            const auto& keys = *reinterpret_cast<const Keys*>(lParam);
+            if (app->exiting || !keys.Valid()) return FALSE;
+            app->keys = keys;
+            app->paused = false;
+            app->Publish();
+            return TRUE;
+        }
         if (message == kElevationMessage)
         {
             if (!app->keys.runAsAdmin) return 0;
@@ -774,6 +1148,8 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             }
             return 0;
         }
+        if (message == kSettingsClosedMessage) { app->SettingsClosed(); return 0; }
+        if (message == WM_CLOSE) { app->Exit(); return 0; }
         if (message == kSwitchMessage) { app->Switch(); return 0; }
         if (message == kTrayMessage)
         {
@@ -788,6 +1164,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
     if (message == WM_DESTROY)
     {
+        if (app) app->monitor.Stop();
         PostQuitMessage(0);
         return 0;
     }
@@ -848,17 +1225,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int)
         DestroyWindow(app.window);
         return 1;
     }
-    gApp = &app;
-    for (UINT vk = 1; vk < 255; ++vk)
-    {
-        // DBE mode VKs describe logical mode state, not a physical held key.
-        if (vk >= 0xF0 && vk <= 0xFD) continue; // VK_DBE_* range.
-        const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX);
-        if (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000)
-            app.filter.down[KeyFilter::Index(vk, scan & 0xFF, (scan & 0xFF00) != 0)] = true;
-    }
-    app.hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, instance, 0);
-    if (!app.hook)
+    app.Publish();
+    if (!app.monitor.Start())
     {
         Error(L"キーボードフックを開始できません。");
         DestroyWindow(app.window);
@@ -880,27 +1248,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int)
         Error(L"INIのキー設定が無効です。異なる2つのキーを登録してください。");
         if (!app.Settings()) { DestroyWindow(app.window); return 0; }
     }
-    app.icon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(IDI_TRAY), IMAGE_ICON,
-        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
-    app.tray.cbSize = sizeof(app.tray);
-    app.tray.hWnd = app.window;
-    app.tray.uID = 1;
-    app.tray.uFlags = NIF_ICON | NIF_MESSAGE;
-    app.tray.uCallbackMessage = kTrayMessage;
-    app.tray.hIcon = app.icon;
-    if (!app.icon)
-    {
-        Error(L"トレイアイコンを作成できません。");
-        DestroyWindow(app.window);
-        return 1;
-    }
-    app.trayAdded = Shell_NotifyIconW(NIM_ADD, &app.tray) != FALSE;
-    if (!app.trayAdded)
-    {
-        Error(L"タスクトレイにアイコンを登録できません。");
-        DestroyWindow(app.window);
-        return 1;
-    }
+    if (loaded && !app.AddTray()) { DestroyWindow(app.window); return 1; }
     MSG message{};
     BOOL status = 0;
     while ((status = GetMessageW(&message, nullptr, 0, 0)) > 0)
