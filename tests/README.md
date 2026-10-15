@@ -27,7 +27,11 @@ Unit tests run a simulated hook on the main thread and the real settings dialog 
 
 Startup tests verify the session-user SID lookup and elevated registry routing, block registry access when identification fails, and check the recovery message and disabled checkbox. Registry-routing failures are simulated; no real startup entry is changed. Elevation using a different administrator account still requires manual verification.
 
+Startup checkbox tests compare the registered EXE path with the running EXE, including quoted paths, spaces, Unicode, and case differences. Another location is unchecked and left untouched by unchecked OK, cancellation, and INI save failure; checking plus saving replaces it with the current EXE. The tests also verify read-only access and an external registry change before OK. Tests use an isolated volatile registry key.
+
 Intent tests cover window/focus changes between acceptance and execution, changes during the IME query, ON/OFF ordering when a fresh query is needed, and preservation of accepted requests across key-setting updates. Settings tests verify that the main thread applies saved keys before the dialog closes. IME responses and SendInput are simulated.
+
+A fresh test process is launched with `STARTF_USESHOWWINDOW` / `SW_HIDE` to verify that the first settings-menu selection displays the dialog. This catches startup-dependent visibility failures that reopening a dialog in the same process would miss. The test uses an isolated INI and registry key, without injecting keyboard input.
 
 デスクトップテストは独立したINIで管理者起動をOFFにして実行します。別のEXE名のコピーも起動し、先に起動したアプリだけが常駐し続けることを確認します。単体テストは昇格要求を模擬し、UAC表示や昇格プロセスの起動は行いません。
 

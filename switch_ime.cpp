@@ -31,6 +31,7 @@ constexpr UINT kStartupErrorMessage = WM_APP + 5;
 constexpr UINT kSettingsClosedMessage = WM_APP + 6;
 constexpr UINT kShowSettingsMessage = WM_APP + 7;
 constexpr UINT kApplySettingsMessage = WM_APP + 8;
+constexpr UINT kActivateSettingsMessage = WM_APP + 9;
 constexpr wchar_t kStartupUserError[] =
     L"管理者権限で実行中ですが\n"
     L"サインイン中のユーザーを取得できなかったため\n"
@@ -450,6 +451,42 @@ bool MakeStartupEntry(const std::wstring& exe, StartupEntry& entry)
     return true;
 }
 
+bool StartupMatchesExe(const StartupEntry& entry, const std::wstring& exe)
+{
+    // Our registration is an absolute REG_SZ command. Do not expand another
+    // user's environment using the account that supplied UAC credentials.
+    if (!entry.exists || entry.type != REG_SZ ||
+        entry.data.empty() || entry.data.size() % sizeof(wchar_t) != 0) return false;
+    std::wstring command(entry.data.size() / sizeof(wchar_t), L'\0');
+    std::memcpy(command.data(), entry.data.data(), entry.data.size());
+    const auto end = command.find(L'\0');
+    if (end == std::wstring::npos) return false;
+    command.resize(end);
+    const auto start = command.find_first_not_of(L" \t\r\n");
+    if (start == std::wstring::npos) return false; // Empty command lines have special argv behavior.
+    int count = 0;
+    LPWSTR* args = CommandLineToArgvW(command.c_str() + start, &count);
+    if (!args) return false;
+    const std::wstring registered = count == 1 ? args[0] : L"";
+    LocalFree(args);
+    auto fullPath = [](const std::wstring& path)
+    {
+        // Do not infer what a relative Run command would resolve to at sign-in.
+        const bool absolute = (path.size() >= 3 && path[1] == L':' &&
+            (path[2] == L'\\' || path[2] == L'/')) ||
+            (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\');
+        if (!absolute) return std::wstring{};
+        const DWORD size = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (!size) return std::wstring{};
+        std::vector<wchar_t> buffer(size);
+        const DWORD length = GetFullPathNameW(path.c_str(), size, buffer.data(), nullptr);
+        return length && length < size ? std::wstring(buffer.data(), length) : std::wstring{};
+    };
+    const auto registeredPath = fullPath(registered), ownPath = fullPath(exe);
+    return !registeredPath.empty() && !ownPath.empty() &&
+        CompareStringOrdinal(registeredPath.c_str(), -1, ownPath.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
 struct DialogState
 {
     Keys keys;
@@ -616,7 +653,9 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
             state->originalStartup = {};
             state->startupError = kStartupRegistryError;
         }
-        CheckDlgButton(dialog, IDC_STARTUP, state->originalStartup.exists ? BST_CHECKED : BST_UNCHECKED);
+        std::wstring exe;
+        const bool registered = GetExePath(exe) && StartupMatchesExe(state->originalStartup, exe);
+        CheckDlgButton(dialog, IDC_STARTUP, registered ? BST_CHECKED : BST_UNCHECKED);
         EnableWindow(GetDlgItem(dialog, IDC_STARTUP), state->startupKey != nullptr);
         for (const int id : {IDC_ON_KEY, IDC_OFF_KEY})
         {
@@ -629,15 +668,18 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
         }
         PublishKeyboardSettings();
         if (state->anchor) PositionSettings(dialog, *state->anchor);
-        SetForegroundWindow(dialog);
+        // DialogBox performs its initial show after WM_INITDIALOG. A hidden
+        // startup can suppress that first show, so activate from its message loop.
+        PostMessageW(dialog, kActivateSettingsMessage, 0, 0);
         if (state->startupError) PostMessageW(dialog, kStartupErrorMessage, 0, 0);
         if (state->closing && state->closing->load()) PostMessageW(dialog, WM_CLOSE, 0, 0);
         return TRUE;
     }
-    if (message == kShowSettingsMessage)
+    if (message == kShowSettingsMessage || message == kActivateSettingsMessage)
     {
+        if (message == kShowSettingsMessage)
+            PositionSettings(dialog, {static_cast<LONG>(wParam), static_cast<LONG>(lParam)});
         ShowWindow(dialog, SW_RESTORE);
-        PositionSettings(dialog, {static_cast<LONG>(wParam), static_cast<LONG>(lParam)});
         SetForegroundWindow(dialog);
         return TRUE;
     }
@@ -658,24 +700,33 @@ INT_PTR CALLBACK SettingsProc(HWND dialog, UINT message, WPARAM wParam, LPARAM l
                 return TRUE;
             }
             StartupEntry desired;
-            if (state->startupKey && IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED)
+            StartupEntry beforeStartup;
+            std::wstring exe;
+            if (state->startupKey && (!ReadStartup(state->startupKey, beforeStartup) || !GetExePath(exe)))
             {
-                std::wstring exe;
-                if (!GetExePath(exe) || !MakeStartupEntry(exe, desired))
+                MessageBoxW(dialog, L"自動起動の登録状態を取得できません。", L"switch_ime", MB_OK | MB_ICONERROR);
+                return TRUE;
+            }
+            const bool enableStartup = IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED;
+            const bool updateStartup = state->startupKey &&
+                (enableStartup || StartupMatchesExe(beforeStartup, exe));
+            if (state->startupKey && enableStartup)
+            {
+                if (!MakeStartupEntry(exe, desired))
                 {
                     MessageBoxW(dialog, L"自動起動に登録できません。EXEのパスが長すぎないか確認してください。",
                         L"switch_ime", MB_OK | MB_ICONERROR);
                     return TRUE;
                 }
             }
-            if (state->startupKey && !WriteStartup(state->startupKey, desired))
+            if (updateStartup && !WriteStartup(state->startupKey, desired))
             {
                 MessageBoxW(dialog, L"自動起動の登録を変更できません。", L"switch_ime", MB_OK | MB_ICONERROR);
                 return TRUE;
             }
             if (!SaveKeys(*state->ini, state->keys))
             {
-                if (state->startupKey && !WriteStartup(state->startupKey, state->originalStartup))
+                if (updateStartup && !WriteStartup(state->startupKey, beforeStartup))
                     MessageBoxW(dialog, L"自動起動の登録状態を元に戻せません。設定を再確認してください。",
                         L"switch_ime", MB_OK | MB_ICONERROR);
                 MessageBoxW(dialog, L"設定を保存できません。EXEのフォルダへの書き込み権限を確認してください。",

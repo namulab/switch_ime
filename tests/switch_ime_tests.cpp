@@ -543,6 +543,7 @@ bool saveDialog = false;
 int startupChoice = -1;
 int adminChoice = -1;
 bool expectSettingsFailure = false;
+const StartupEntry* startupBeforeOk = nullptr;
 std::wstring screenshot;
 
 void Snapshot(HWND dialog)
@@ -642,8 +643,12 @@ INT_PTR CALLBACK TestDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
             "administrator checkbox reflects saved setting");
         if (adminChoice >= 0) CheckDlgButton(dialog, IDC_ADMIN, adminChoice ? BST_CHECKED : BST_UNCHECKED);
         if (state->startupKey)
-            Check((IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) == state->originalStartup.exists,
-                "startup checkbox reflects registry entry");
+        {
+            std::wstring exe;
+            Check(GetExePath(exe) && (IsDlgButtonChecked(dialog, IDC_STARTUP) == BST_CHECKED) ==
+                StartupMatchesExe(state->originalStartup, exe),
+                "startup checkbox reflects registration of this executable rather than existence of any entry");
+        }
         if (startupChoice >= 0)
             CheckDlgButton(dialog, IDC_STARTUP, startupChoice ? BST_CHECKED : BST_UNCHECKED);
         Check(state->keys.on == VK_KANA, "native IME key registered before translation");
@@ -682,6 +687,8 @@ INT_PTR CALLBACK TestDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         testForeground = nullptr;
         CloseHandle(testHookEvent);
         testHookEvent = nullptr;
+        if (startupBeforeOk && state->startupKey)
+            Check(WriteStartup(state->startupKey, *startupBeforeOk), "startup registration changes externally before OK");
         const unsigned messages = testErrorMessages;
         const INT_PTR result = SettingsProc(dialog, WM_COMMAND, saveDialog ? IDOK : IDCANCEL, 0);
         if (expectSettingsFailure)
@@ -1029,8 +1036,82 @@ void CheckSettingsThread(const std::wstring& folder)
 }
 }
 
+namespace
+{
+int FirstSettingsMenuChild(const std::wstring& folder)
+{
+    testElevation = 0;
+    const std::wstring keyPath = L"Software\\namulab\\switch_ime.FirstShow." +
+        std::to_wstring(GetCurrentProcessId());
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, keyPath.c_str(), 0, nullptr, REG_OPTION_VOLATILE,
+        KEY_ALL_ACCESS, nullptr, &testStartupOverride, nullptr) != ERROR_SUCCESS) return 1;
+    const auto instance = GetModuleHandleW(nullptr);
+    WNDCLASSW cls{};
+    cls.lpfnWndProc = WindowProc;
+    cls.hInstance = instance;
+    cls.lpszClassName = L"switch_ime.TestFirstSettings";
+    RegisterClassW(&cls);
+    bool firstVisible = false, secondVisible = false;
+    {
+        App app;
+        app.instance = instance;
+        app.keys = {VK_F13, VK_F14};
+        app.ini = folder + L"\\first-show-" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+        if (!SaveKeys(app.ini, app.keys)) return 1;
+        app.window = CreateWindowExW(WS_EX_TOOLWINDOW, cls.lpszClassName, L"", WS_OVERLAPPED,
+            0, 0, 0, 0, nullptr, nullptr, instance, &app);
+        app.Publish();
+        auto visible = [&]()
+        {
+            const HWND view = app.settings.dialog.load();
+            return view && IsWindowVisible(view);
+        };
+        testMenuCommand = kSettingsCommand;
+        app.Menu(); // The first settings selection since process startup.
+        firstVisible = PumpUntil(visible);
+        if (!firstVisible)
+        {
+            app.Menu();
+            secondVisible = PumpUntil(visible);
+        }
+        app.Exit();
+        if (!PumpUntil([&]() { return !IsWindow(app.window); })) return 1;
+        DeleteFileW(app.ini.c_str());
+    }
+    RegCloseKey(testStartupOverride);
+    testStartupOverride = nullptr;
+    RegDeleteKeyW(HKEY_CURRENT_USER, keyPath.c_str());
+    UnregisterClassW(cls.lpszClassName, instance);
+    return firstVisible ? 0 : (secondVisible ? 2 : 1);
+}
+
+void CheckFirstSettingsMenu(const std::wstring& folder)
+{
+    std::wstring exe;
+    Check(GetExePath(exe), "first-show test executable path available");
+    std::wstring command = L"\"" + exe + L"\" --first-settings-menu \"" + folder + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION child{};
+    Check(CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
+        nullptr, nullptr, &startup, &child) != FALSE, "first-show regression starts a fresh hidden process");
+    const DWORD waited = WaitForSingleObject(child.hProcess, 12000);
+    DWORD result = 1;
+    GetExitCodeProcess(child.hProcess, &result);
+    if (waited != WAIT_OBJECT_0) { TerminateProcess(child.hProcess, 1); WaitForSingleObject(child.hProcess, 2000); }
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    if (result == 2) std::fputs("REPRODUCED: first settings selection is hidden; second selection shows it.\n", stderr);
+    Check(waited == WAIT_OBJECT_0 && result == 0, "first settings menu selection displays dialog even after SW_HIDE startup");
+}
+}
+
 int wmain(int argc, wchar_t** argv)
 {
+    if (argc == 3 && lstrcmpW(argv[1], L"--first-settings-menu") == 0)
+        return FirstSettingsMenuChild(argv[2]);
     Check(argc == 1 || argc == 2, "optional test output directory argument");
     std::wstring folder;
     if (argc == 2) folder = argv[1];
@@ -1130,7 +1211,51 @@ int wmain(int argc, wchar_t** argv)
     StartupEntry expected;
     Check(GetExePath(exe) && MakeStartupEntry(exe, expected) && entry.data == expected.data,
         "startup command quotes exact executable path");
+    Check(StartupMatchesExe(expected, exe), "current executable startup path matches");
     Check(MakeStartupEntry(L"C:\\日本語 folder\\switch_ime.exe", entry), "Unicode and spaces accepted in startup path");
+    Check(StartupMatchesExe(entry, L"c:\\日本語 folder\\SWITCH_IME.exe") &&
+        !StartupMatchesExe(entry, L"C:\\other\\switch_ime.exe"),
+        "startup path comparison handles Unicode spaces and case but rejects another folder");
+    Check(!StartupMatchesExe({}, exe), "missing startup value is unchecked");
+    StartupEntry malformed = expected;
+    malformed.data.pop_back();
+    Check(!StartupMatchesExe(malformed, exe), "malformed startup data cannot check the box");
+    saveDialog = false;
+    startupChoice = -1;
+    Check(WriteStartup(startupKey, entry) && showStartup() == IDCANCEL &&
+        ReadStartup(startupKey, entry) && !StartupMatchesExe(entry, exe),
+        "another executable is shown unchecked and cancel preserves its registration");
+    const StartupEntry otherExecutable = entry;
+    saveDialog = true;
+    startupChoice = 0;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) &&
+        entry.exists && entry.type == otherExecutable.type && entry.data == otherExecutable.data,
+        "unchecked OK preserves another executable registration while saving key settings");
+    HKEY otherReadOnly = nullptr;
+    Check(RegOpenKeyExW(HKEY_CURRENT_USER, testKey.c_str(), 0, KEY_QUERY_VALUE,
+        &otherReadOnly) == ERROR_SUCCESS, "read-only handle for another executable available");
+    startup.startupKey = otherReadOnly;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) && entry.data == otherExecutable.data,
+        "unchecked OK does not attempt to write another executable registration");
+    const std::wstring otherBadIni = folder + L"\\missing-folder\\other-settings.ini";
+    startup.ini = &otherBadIni;
+    expectSettingsFailure = true;
+    Check(showStartup() == IDCANCEL && ReadStartup(startupKey, entry) && entry.data == otherExecutable.data,
+        "INI save failure also leaves another executable registration completely untouched");
+    expectSettingsFailure = false;
+    startup.ini = &ini;
+    RegCloseKey(otherReadOnly);
+    startup.startupKey = startupKey;
+    startupChoice = 1;
+    saveDialog = true;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) && entry.data == expected.data,
+        "checking and saving replaces another executable registration with this executable");
+    startupChoice = 0;
+    startupBeforeOk = &otherExecutable;
+    Check(showStartup() == IDOK && ReadStartup(startupKey, entry) && entry.data == otherExecutable.data,
+        "unchecked OK rechecks current registry path and preserves an external replacement");
+    startupBeforeOk = nullptr;
+    Check(WriteStartup(startupKey, expected), "own startup registration restored for removal tests");
     Check(!MakeStartupEntry(std::wstring(259, L'x'), entry), "overlong Run command rejected");
     saveDialog = false;
     startupChoice = 0;
@@ -1179,6 +1304,7 @@ int wmain(int argc, wchar_t** argv)
     Check(QueryIme(fake, kGetOpen, response) && response == 0, "delivered zero differs from send failure");
     DestroyWindow(fake);
     Check(!QueryIme(fake, kGetOpen, response), "destroyed IME window is acquisition failure");
+    CheckFirstSettingsMenu(folder);
     CheckIntentTargets();
     CheckSettingsThread(folder);
     CheckFixedTray();
